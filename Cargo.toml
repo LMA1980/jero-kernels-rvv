@@ -4,7 +4,7 @@ description = "VLA RVV 1.0 compute kernels with portable scalar fallbacks for th
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-license = "AGPL-3.0-only"
+license = "LGPL-3.0-only WITH LGPL-3.0-linking-exception"
 repository = "https://github.com/LMA1980/k3-kernels-rvv"
 
 [lints.rust]
