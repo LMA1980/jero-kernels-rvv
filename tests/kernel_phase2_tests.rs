@@ -109,7 +109,7 @@ fn test_rope_inplace_multihead_consistency() {
         qk[2 * head_dim + d] = val; // Head 2
     }
 
-    apply_rope_inplace(&mut qk, head_dim, 5, 10_000.0, None).expect("apply rope to multihead");
+    apply_rope_inplace(&mut qk, head_dim, 5, 5, 10_000.0, None).expect("apply rope to multihead");
 
     // Both identical heads should be rotated identically
     for d in 0..head_dim {

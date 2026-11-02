@@ -128,17 +128,16 @@ pub fn precompute_rope_inv_freq(
                 let low_freq_wavelen = orig_ctx_f32 / low_freq_factor;
                 let high_freq_wavelen = orig_ctx_f32 / high_freq_factor;
 
-                let scale = if wavelen < high_freq_wavelen {
-                    1.0_f32
+                if wavelen < high_freq_wavelen {
+                    base_theta_i
                 } else if wavelen > low_freq_wavelen {
-                    *factor
+                    base_theta_i / factor
                 } else {
-                    let smooth =
-                        (wavelen - high_freq_wavelen) / (low_freq_wavelen - high_freq_wavelen);
-                    (1.0_f32 - smooth) + smooth * factor
-                };
-
-                base_theta_i / scale
+                    let smooth = ((orig_ctx_f32 / wavelen) - low_freq_factor)
+                        / (high_freq_factor - low_freq_factor);
+                    let smooth = smooth.clamp(0.0, 1.0);
+                    (1.0_f32 - smooth) * (base_theta_i / factor) + smooth * base_theta_i
+                }
             }
             Some(RopeScalingConfig::LongRope {
                 short_factor,
@@ -195,6 +194,7 @@ pub fn apply_rope_inplace(
     qk: &mut [f32],
     head_dim: usize,
     pos: usize,
+    seq_len: usize,
     theta_base: f32,
     scaling: Option<&RopeScalingConfig>,
 ) -> Result<(), K3Error> {
@@ -221,15 +221,64 @@ pub fn apply_rope_inplace(
         });
     }
 
-    // Precompute inv_freq table for current position
-    let inv_freq = precompute_rope_inv_freq(head_dim, theta_base, scaling, pos)?;
+    let inv_freq = precompute_rope_inv_freq(head_dim, theta_base, scaling, seq_len)?;
+    apply_rope_with_inv_freq(qk, head_dim, pos, &inv_freq)
+}
+
+/// Applies rotary position embeddings in-place using a precomputed inverse frequency table.
+///
+/// Enables zero-allocation per-token rotation when `precompute_rope_inv_freq` is computed
+/// once per sequence.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `head_dim` is odd, zero, or `qk.len() % head_dim != 0`.
+/// Returns [`K3Error::CapabilityMismatch`] if `inv_freq.len() != head_dim / 2`.
+pub fn apply_rope_with_inv_freq(
+    qk: &mut [f32],
+    head_dim: usize,
+    pos: usize,
+    inv_freq: &[f32],
+) -> Result<(), K3Error> {
+    if head_dim == 0 || head_dim % 2 != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "rope_qk".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(qk),
+            buffer_len: size_of_val(qk),
+            reason: format!("head_dim must be positive and even, got {head_dim}"),
+        });
+    }
+
+    if qk.len() % head_dim != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "rope_qk".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(qk),
+            buffer_len: size_of_val(qk),
+            reason: format!(
+                "qk buffer length {} is not divisible by head_dim {head_dim}",
+                qk.len()
+            ),
+        });
+    }
+
+    let half = head_dim / 2;
+    if inv_freq.len() != half {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "rope".to_owned(),
+            reason: format!(
+                "inv_freq table length {} must equal head_dim / 2 ({half})",
+                inv_freq.len()
+            ),
+        });
+    }
 
     // At position 0, cos(0) = 1.0 and sin(0) = 0.0, so rotation is exact identity
     if pos == 0 {
         return Ok(());
     }
 
-    let half = head_dim / 2;
     #[expect(
         clippy::cast_precision_loss,
         reason = "sequence position fits comfortably in f32"
@@ -238,7 +287,7 @@ pub fn apply_rope_inplace(
 
     let mut cos_table = Vec::with_capacity(half);
     let mut sin_table = Vec::with_capacity(half);
-    for &freq in &inv_freq {
+    for &freq in inv_freq {
         let angle = pos_f32 * freq;
         cos_table.push(angle.cos());
         sin_table.push(angle.sin());
@@ -414,14 +463,14 @@ mod tests {
     fn test_apply_rope_inplace_identity_at_pos_zero() {
         let mut qk = [1.0_f32, 2.0, 3.0, 4.0];
         let copy = qk;
-        apply_rope_inplace(&mut qk, 4, 0, 10000.0, None).expect("pos 0 is exact identity");
+        apply_rope_inplace(&mut qk, 4, 0, 4, 10000.0, None).expect("pos 0 is exact identity");
         assert_eq!(qk, copy);
     }
 
     #[test]
     fn test_apply_rope_inplace_rotation() {
         let mut qk = [1.0_f32, 0.0, 0.0, 1.0];
-        apply_rope_inplace(&mut qk, 4, 1, 10000.0, None).expect("rotation at pos 1");
+        apply_rope_inplace(&mut qk, 4, 1, 4, 10000.0, None).expect("rotation at pos 1");
 
         // head_dim=4, half=2. Pair 0: (qk[0], qk[2]), Pair 1: (qk[1], qk[3])
         // inv_freq[0] = 1.0, angle0 = 1.0
@@ -436,14 +485,14 @@ mod tests {
         let mut qk = [1.0_f32; 5];
         // Odd head_dim
         assert!(matches!(
-            apply_rope_inplace(&mut qk, 5, 1, 10000.0, None),
+            apply_rope_inplace(&mut qk, 5, 1, 5, 10000.0, None),
             Err(K3Error::TensorBoundsError { .. })
         ));
 
         let mut qk2 = [1.0_f32; 7];
         // qk.len() not divisible by head_dim
         assert!(matches!(
-            apply_rope_inplace(&mut qk2, 4, 1, 10000.0, None),
+            apply_rope_inplace(&mut qk2, 4, 1, 4, 10000.0, None),
             Err(K3Error::TensorBoundsError { .. })
         ));
 

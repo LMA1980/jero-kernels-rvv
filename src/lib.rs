@@ -21,7 +21,9 @@ pub use quant::{
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use quant::{vec_dot_q6_k_rvv, vec_dot_q8_0_rvv};
-pub use rope::{RopeScalingConfig, apply_rope_inplace, precompute_rope_inv_freq};
+pub use rope::{
+    RopeScalingConfig, apply_rope_inplace, apply_rope_with_inv_freq, precompute_rope_inv_freq,
+};
 pub use swiglu::{bf16_to_f32_finite, swiglu_f32};
 
 /// Number of scalar elements per `Q4_K_M` super-block.
