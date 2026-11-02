@@ -7,7 +7,24 @@
 
 use k3_core::{K3Error, QuantType, TensorView};
 
+pub mod attention;
 pub mod ime;
+pub mod quant;
+pub mod rope;
+pub mod swiglu;
+
+pub use attention::gqa_causal_attention_f32;
+pub use quant::{
+    Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
+    dequantize_q6_k_block, dequantize_q8_0_block, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0,
+    vec_dot_q8_0_scalar,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use quant::{vec_dot_q6_k_rvv, vec_dot_q8_0_rvv};
+pub use rope::{
+    RopeScalingConfig, apply_rope_inplace, apply_rope_with_inv_freq, precompute_rope_inv_freq,
+};
+pub use swiglu::{bf16_to_f32_finite, swiglu_f32};
 
 /// Number of scalar elements per `Q4_K_M` super-block.
 pub const Q4_K_M_BLOCK_ELEMENTS: usize = 256;
@@ -39,6 +56,30 @@ pub trait VectorKernel: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`K3Error::TensorBoundsError`] if dimensions do not align or weights are malformed.
     fn vec_dot_q4_k_m(
+        &self,
+        output: &mut [f32],
+        weights: &TensorView<'_>,
+        input: &[f32],
+    ) -> Result<(), K3Error>;
+
+    /// Computes matrix-vector multiplication with `Q8_0` quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions do not align or weights are malformed.
+    fn vec_dot_q8_0(
+        &self,
+        output: &mut [f32],
+        weights: &TensorView<'_>,
+        input: &[f32],
+    ) -> Result<(), K3Error>;
+
+    /// Computes matrix-vector multiplication with `Q6_K` quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions do not align or weights are malformed.
+    fn vec_dot_q6_k(
         &self,
         output: &mut [f32],
         weights: &TensorView<'_>,
@@ -100,6 +141,38 @@ impl VectorKernel for BaselineKernel {
         #[cfg(any(not(target_arch = "riscv64"), miri))]
         {
             vec_dot_q4_k_m_scalar(output, weights, input)
+        }
+    }
+
+    fn vec_dot_q8_0(
+        &self,
+        output: &mut [f32],
+        weights: &TensorView<'_>,
+        input: &[f32],
+    ) -> Result<(), K3Error> {
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            vec_dot_q8_0_rvv(output, weights, input)
+        }
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
+        {
+            vec_dot_q8_0_scalar(output, weights, input)
+        }
+    }
+
+    fn vec_dot_q6_k(
+        &self,
+        output: &mut [f32],
+        weights: &TensorView<'_>,
+        input: &[f32],
+    ) -> Result<(), K3Error> {
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            vec_dot_q6_k_rvv(output, weights, input)
+        }
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
+        {
+            vec_dot_q6_k_scalar(output, weights, input)
         }
     }
 }

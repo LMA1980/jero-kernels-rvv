@@ -1,0 +1,6 @@
+name = "kernels-rvv"
+# Crate-embedded Symposium manifest for kernels-rvv.
+
+[[plugins]]
+depends-on = ["k3-core"]
+source.cargo = "k3-core"
