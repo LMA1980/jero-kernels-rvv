@@ -14,6 +14,10 @@ pub mod rope;
 pub mod swiglu;
 
 pub use attention::gqa_causal_attention_f32;
+pub use ime::{
+    TQ1_0_BLOCK_BYTES, TQ1_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES, TQ2_0_BLOCK_ELEMENTS,
+    bitlinear_i8_ime, bitlinear_i8_rvv, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8,
+};
 pub use quant::{
     Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
     dequantize_q6_k_block, dequantize_q8_0_block, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0,
@@ -451,6 +455,181 @@ pub fn rmsnorm_rvv(
     }
 
     Ok(())
+}
+
+/// Computes Sub-Layer Normalization (`SubLN`): `RMSNorm` followed by dynamic per-token `absmax`
+/// quantization into signed 8-bit integers (`i8`).
+///
+/// # Mathematical Formulation
+///
+/// 1. Computes `RMSNorm`:
+///    $$x_{norm}[i] = \frac{input[i]}{\sqrt{\frac{1}{N} \sum_{j=0}^{N-1} input[j]^2 + \epsilon}} \times norm\_weight[i]$$
+/// 2. Determines dynamic per-token absolute maximum:
+///    $$max\_val = \max_{i} |x_{norm}[i]|$$
+/// 3. Computes dequantization scale:
+///    $$scale = \frac{max\_val}{127.0}$$
+/// 4. Quantizes symmetrically to `i8`:
+///    $$out\_i8[i] = \text{round}\left(\frac{x_{norm}[i]}{scale}\right).\text{clamp}(-128.0, 127.0) \text{ as } i8$$
+///
+/// # Safety and Numerical Stability
+///
+/// If $max\_val < 10^{-12}$ or is non-finite (`NaN`), `out_i8` is filled with zeroes and a safe
+/// scale of `1.0 / 127.0` is returned without division by zero or NaN propagation.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if slice lengths do not match or are empty.
+pub fn subln_quantize_absmax_i8(
+    out_i8: &mut [i8],
+    input: &[f32],
+    norm_weight: &[f32],
+    eps: f32,
+) -> Result<f32, K3Error> {
+    let len = input.len();
+    if len == 0 || out_i8.len() != len || norm_weight.len() != len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "subln".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(out_i8),
+            buffer_len: size_of_val(input),
+            reason: format!(
+                "dimension mismatch: input={len}, out_i8={}, norm_weight={}",
+                out_i8.len(),
+                norm_weight.len()
+            ),
+        });
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    let sum_sq = dot_product_f32_rvv(input, input);
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    let sum_sq = dot_product_f32_scalar(input, input);
+
+    #[expect(clippy::cast_precision_loss, reason = "length fits comfortably in f32")]
+    let mean_sq = sum_sq / (len as f32);
+    let inv_rms = 1.0_f32 / (mean_sq + eps).sqrt();
+
+    // Pass 1: compute max absolute value of normalized activation without heap allocation
+    let mut max_val = 0.0_f32;
+    for i in 0..len {
+        let x_norm = input[i] * inv_rms * norm_weight[i];
+        let abs_val = x_norm.abs();
+        if abs_val > max_val {
+            max_val = abs_val;
+        }
+    }
+
+    // Defensive guard: all-zero, near-zero, or NaN inputs
+    if max_val.is_nan() || max_val < 1e-12_f32 {
+        out_i8.fill(0);
+        return Ok(1.0_f32 / 127.0_f32);
+    }
+
+    let scale = max_val / 127.0_f32;
+
+    // Pass 2: quantize into out_i8
+    for i in 0..len {
+        let x_norm = input[i] * inv_rms * norm_weight[i];
+        let q = (x_norm / scale).round().clamp(-128.0_f32, 127.0_f32);
+        #[expect(clippy::cast_possible_truncation, reason = "clamped to [-128, 127]")]
+        {
+            out_i8[i] = q as i8;
+        }
+    }
+
+    Ok(scale)
+}
+
+/// Computes the gated $\text{ReLU}^2$ activation: $out[i] = (\max(0.0, gate[i]))^2 \times up[i]$.
+///
+/// Used in `bitnet-b1.58-2B-4T` feed-forward networks (FFN) to provide strong non-linear gating
+/// while maintaining sparsity.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `out`, `gate`, and `up` lengths do not match or are empty.
+pub fn relu_squared_gate_f32(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Error> {
+    let len = gate.len();
+    if len == 0 || out.len() != len || up.len() != len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "relu_squared".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(out),
+            buffer_len: size_of_val(gate),
+            reason: format!(
+                "dimension mismatch: gate={len}, up={}, out={}",
+                up.len(),
+                out.len()
+            ),
+        });
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        relu_squared_gate_rvv(out, gate, up);
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        relu_squared_gate_scalar(out, gate, up);
+    }
+
+    Ok(())
+}
+
+/// Portable scalar $\text{ReLU}^2$ gating.
+pub fn relu_squared_gate_scalar(out: &mut [f32], gate: &[f32], up: &[f32]) {
+    let len = gate.len().min(out.len()).min(up.len());
+    for i in 0..len {
+        let g = gate[i];
+        let relu = if g > 0.0_f32 { g } else { 0.0_f32 };
+        out[i] = relu * relu * up[i];
+    }
+}
+
+/// VLA RVV 1.0 SIMD accelerated $\text{ReLU}^2$ gating.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[allow(unused_assignments)]
+pub fn relu_squared_gate_rvv(out: &mut [f32], gate: &[f32], up: &[f32]) {
+    let len = gate.len().min(out.len()).min(up.len());
+    if len == 0 {
+        return;
+    }
+    let mut pg = gate.as_ptr();
+    let mut pu = up.as_ptr();
+    let mut po = out.as_mut_ptr();
+    let mut rem = len;
+    let zero = 0.0_f32;
+
+    // SAFETY: `pg`, `pu`, and `po` point to valid slices of length at least `rem` f32 elements.
+    // Strip-mined RVV 1.0 loop computes max(0.0, gate[i])^2 * up[i] compatible with both X100 and A100.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "vsetvli t0, {rem}, e32, m1, ta, ma",
+            "vle32.v v1, ({pg})",
+            "vfmax.vf v1, v1, {zero}",
+            "vfmul.vv v1, v1, v1",
+            "vle32.v v2, ({pu})",
+            "vfmul.vv v1, v1, v2",
+            "vse32.v v1, ({po})",
+            "slli t1, t0, 2",
+            "add {pg}, {pg}, t1",
+            "add {pu}, {pu}, t1",
+            "add {po}, {po}, t1",
+            "sub {rem}, {rem}, t0",
+            "bnez {rem}, 2b",
+            pg = inout(reg) pg,
+            pu = inout(reg) pu,
+            po = inout(reg) po,
+            rem = inout(reg) rem,
+            zero = in(freg) zero,
+            out("t0") _,
+            out("t1") _,
+            out("v1") _,
+            out("v2") _,
+            options(nostack),
+        );
+    }
 }
 
 fn validate_q4_k_m_dimensions(
