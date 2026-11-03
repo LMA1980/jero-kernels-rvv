@@ -40,8 +40,6 @@ profiles:
       - /var/lib/action-runner/.cargo
       - /var/lib/action-runner/.local
       - /var/lib/action-runner
-      - /opt/llvm-24-spacemit-x100
-      - /opt/gcc-17-spacemit-x100
     write_paths:
       - /var/lib/action-runner
       - /tmp
@@ -52,8 +50,6 @@ profiles:
       - /var/lib/action-runner/.cargo/bin
       - /var/lib/action-runner/.rustup
       - /var/lib/action-runner/.local/bin
-      - /opt/llvm-24-spacemit-x100/bin
-      - /opt/gcc-17-spacemit-x100/bin
     network_egress_cidrs: []
     memlock_limit_kb: 29360128
     max_pids: 256
