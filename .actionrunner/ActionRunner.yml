@@ -48,6 +48,7 @@ tasks:
     env:
       CARGO_TARGET_DIR: "target"
       MIRIFLAGS: "-Zmiri-disable-isolation"
+      TMPDIR: "/var/lib/action-runner/.cache"
     timeout_seconds: 1800
     sandbox_profile: "default_ci"
 
