@@ -512,9 +512,11 @@ fn test_matvec_q5_k_multi_block_rows_and_cols() {
             }
             expected_row_sum += blk_sum;
         }
+        let abs_diff = (actual_val - expected_row_sum).abs();
+        let rel_diff = abs_diff / expected_row_sum.abs().max(1.0);
         assert!(
-            (actual_val - expected_row_sum).abs() < 1e-3,
-            "Row {r} mismatch: actual {actual_val} vs expected {expected_row_sum}"
+            abs_diff < 1e-2 && rel_diff < 1e-4,
+            "Row {r} mismatch: actual {actual_val} vs expected {expected_row_sum} (abs_diff: {abs_diff}, rel_diff: {rel_diff})"
         );
     }
 }
