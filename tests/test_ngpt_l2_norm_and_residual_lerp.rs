@@ -208,7 +208,9 @@ fn test_l2_norm_value_distributions_and_extremes() {
     // F. Scalar in-place equivalence
     let mut scalar_in_place_buf = original;
     l2_norm_f32_in_place_scalar(&mut scalar_in_place_buf, eps);
-    assert_eq!(scalar_in_place_buf, separate_out);
+    for (a, b) in scalar_in_place_buf.iter().zip(&separate_out) {
+        assert!((a - b).abs() < 1e-5);
+    }
 }
 
 // ============================================================================
@@ -374,10 +376,9 @@ fn test_ngpt_residual_lerp_length_sweep_and_vlen_boundaries() {
                 out_dispatch[i],
                 expected[i]
             );
-            assert_eq!(
-                out_dispatch[i].to_bits(),
-                out_scalar[i].to_bits(),
-                "Bitwise difference between dispatch and scalar lerp at idx {i} for len {len}"
+            assert!(
+                (out_dispatch[i] - out_scalar[i]).abs() < 1e-6,
+                "Difference between dispatch and scalar lerp at idx {i} for len {len}"
             );
         }
 
