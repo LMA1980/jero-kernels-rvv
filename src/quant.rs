@@ -1,9 +1,9 @@
-//! Block dequantization and quantized vector dot product primitives for `Q8_0` and `Q6_K`.
+//! Block dequantization and quantized vector dot product primitives for `Q8_0`, `Q6_K`, and `Q5_K`.
 //!
 //! Provides bit-equivalent dequantization routines matching GGUF / `llama.cpp` definitions
 //! and matrix-vector dot dispatchers for both VLA RVV 1.0 and portable scalar execution.
 
-use k3_core::{K3Error, QuantType, TensorView};
+use k3_core::{BlockQ5_K, K3Error, QuantType, TensorView};
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::dot_product_f32_rvv;
@@ -21,6 +21,12 @@ pub const Q6_K_BLOCK_ELEMENTS: usize = 256;
 
 /// Storage size in bytes of a single `Q6_K` super-block.
 pub const Q6_K_BLOCK_BYTES: usize = 210;
+
+/// Number of scalar elements in a single `Q5_K` super-block.
+pub const Q5_K_BLOCK_ELEMENTS: usize = 256;
+
+/// Storage size in bytes of a single `Q5_K` super-block.
+pub const Q5_K_BLOCK_BYTES: usize = 176;
 
 /// Dequantizes a 34-byte `Q8_0` block (2B `f16` scale + 32 signed `i8` values) into 32 `f32` elements.
 pub fn dequantize_q8_0_block(block: &[u8; Q8_0_BLOCK_BYTES], out: &mut [f32; Q8_0_BLOCK_ELEMENTS]) {
@@ -99,6 +105,118 @@ pub fn dequantize_q6_k_block(block: &[u8; Q6_K_BLOCK_BYTES], out: &mut [f32; Q6_
             out[n + l + 64] = d * sc3 * f32::from(q3);
             out[n + l + 96] = d * sc4 * f32::from(q4);
         }
+    }
+}
+
+/// Dequantizes a 176-byte `Q5_K` super-block into 256 `f32` elements matching GGML `dequantize_row_q5_K`.
+pub fn dequantize_q5_k_block(block: &[u8; Q5_K_BLOCK_BYTES], out: &mut [f32; Q5_K_BLOCK_ELEMENTS]) {
+    let d_bits = u16::from_le_bytes([block[0], block[1]]);
+    let dmin_bits = u16::from_le_bytes([block[2], block[3]]);
+    let d = f16_to_f32_finite(d_bits);
+    let dmin = f16_to_f32_finite(dmin_bits);
+
+    if d == 0.0 && dmin == 0.0 {
+        out.fill(0.0);
+        return;
+    }
+
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+
+    let mut sc = [0u8; 8];
+    let mut m = [0u8; 8];
+    for j in 0..4 {
+        sc[j] = scales[j] & 0x3F;
+        m[j] = scales[j + 4] & 0x3F;
+    }
+    for j in 4..8 {
+        sc[j] = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        m[j] = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+
+    let mut out_idx = 0usize;
+    let mut q_offset = 0usize;
+    let mut u1 = 1u8;
+    let mut u2 = 2u8;
+
+    for chunk in 0..4 {
+        let is = chunk * 2;
+        let d1 = d * f32::from(sc[is]);
+        let m1 = dmin * f32::from(m[is]);
+        let d2 = d * f32::from(sc[is + 1]);
+        let m2 = dmin * f32::from(m[is + 1]);
+
+        for l in 0..32 {
+            let high_bit = if (qh[l] & u1) != 0 { 16_u8 } else { 0_u8 };
+            let q1 = (qs[q_offset + l] & 0x0F) + high_bit;
+            out[out_idx + l] = d1 * f32::from(q1) - m1;
+        }
+        for l in 0..32 {
+            let high_bit = if (qh[l] & u2) != 0 { 16_u8 } else { 0_u8 };
+            let q2 = (qs[q_offset + l] >> 4) + high_bit;
+            out[out_idx + 32 + l] = d2 * f32::from(q2) - m2;
+        }
+
+        out_idx += 64;
+        q_offset += 32;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+/// Dequantizes a structured [`BlockQ5_K`] into 256 `f32` elements.
+pub fn dequantize_q5_k_block_struct(block: &BlockQ5_K, out: &mut [f32; Q5_K_BLOCK_ELEMENTS]) {
+    let d = f16_to_f32_finite(block.d);
+    let dmin = f16_to_f32_finite(block.dmin);
+
+    if d == 0.0 && dmin == 0.0 {
+        out.fill(0.0);
+        return;
+    }
+
+    let scales = &block.scales;
+    let qh = &block.qh;
+    let qs = &block.qs;
+
+    let mut sc = [0u8; 8];
+    let mut m = [0u8; 8];
+    for j in 0..4 {
+        sc[j] = scales[j] & 0x3F;
+        m[j] = scales[j + 4] & 0x3F;
+    }
+    for j in 4..8 {
+        sc[j] = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        m[j] = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+
+    let mut out_idx = 0usize;
+    let mut q_offset = 0usize;
+    let mut u1 = 1u8;
+    let mut u2 = 2u8;
+
+    for chunk in 0..4 {
+        let is = chunk * 2;
+        let d1 = d * f32::from(sc[is]);
+        let m1 = dmin * f32::from(m[is]);
+        let d2 = d * f32::from(sc[is + 1]);
+        let m2 = dmin * f32::from(m[is + 1]);
+
+        for l in 0..32 {
+            let high_bit = if (qh[l] & u1) != 0 { 16_u8 } else { 0_u8 };
+            let q1 = (qs[q_offset + l] & 0x0F) + high_bit;
+            out[out_idx + l] = d1 * f32::from(q1) - m1;
+        }
+        for l in 0..32 {
+            let high_bit = if (qh[l] & u2) != 0 { 16_u8 } else { 0_u8 };
+            let q2 = (qs[q_offset + l] >> 4) + high_bit;
+            out[out_idx + 32 + l] = d2 * f32::from(q2) - m2;
+        }
+
+        out_idx += 64;
+        q_offset += 32;
+        u1 <<= 2;
+        u2 <<= 2;
     }
 }
 
@@ -444,6 +562,245 @@ pub fn vec_dot_q6_k(
     }
 }
 
+/// Validates matrix dimensions and tensor bounds for `Q5_K` matrix-vector operations.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q5_K`, dimensions do not match,
+/// or columns are not divisible by 256.
+pub fn validate_q5_k_dimensions(
+    output_len: usize,
+    weights: &TensorView<'_>,
+    input_len: usize,
+) -> Result<(usize, usize), K3Error> {
+    if weights.quant() != QuantType::Q5_K {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!("expected Q5_K quant type, got {:?}", weights.quant()),
+        });
+    }
+
+    let shape = weights.shape();
+    if shape.is_empty() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: "empty tensor shape".to_owned(),
+        });
+    }
+
+    if shape.len() == 2 {
+        let dim0 = shape[0];
+        let dim1 = shape[1];
+        if output_len == dim0 && input_len == dim1 && dim1 % Q5_K_BLOCK_ELEMENTS == 0 {
+            return Ok((dim0, dim1));
+        }
+        if output_len == dim1 && input_len == dim0 && dim0 % Q5_K_BLOCK_ELEMENTS == 0 {
+            return Ok((dim1, dim0));
+        }
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "matrix shape [{dim0}, {dim1}] does not match output len {output_len} and Q5_K-aligned input len {input_len}"
+            ),
+        });
+    }
+
+    let total_elems = weights.num_elements();
+    if input_len == 0
+        || output_len == 0
+        || input_len % Q5_K_BLOCK_ELEMENTS != 0
+        || output_len * input_len != total_elems
+    {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "tensor elements {total_elems} do not match output len {output_len} * input len {input_len}"
+            ),
+        });
+    }
+
+    Ok((output_len, input_len))
+}
+
+/// Computes matrix-vector multiplication with `Q5_K` quantized weights using portable scalar arithmetic.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q5_K` or dimensions mismatch.
+pub fn vec_dot_q5_k_scalar(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) = validate_q5_k_dimensions(output.len(), weights, input.len())?;
+    let blocks_per_row = cols / Q5_K_BLOCK_ELEMENTS;
+    let raw_bytes = weights.as_bytes();
+    let mut dequant_buf = [0.0_f32; Q5_K_BLOCK_ELEMENTS];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let mut row_sum = 0.0_f32;
+        for blk_idx in 0..blocks_per_row {
+            let block_index = row * blocks_per_row + blk_idx;
+            let byte_start = block_index * Q5_K_BLOCK_BYTES;
+            let byte_end = byte_start + Q5_K_BLOCK_BYTES;
+            let block_slice: &[u8; Q5_K_BLOCK_BYTES] = raw_bytes[byte_start..byte_end]
+                .try_into()
+                .map_err(|_| K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: byte_start,
+                byte_len: Q5_K_BLOCK_BYTES,
+                buffer_len: raw_bytes.len(),
+                reason: "failed to slice Q5_K block".to_owned(),
+            })?;
+
+            dequantize_q5_k_block(block_slice, &mut dequant_buf);
+            let input_sub =
+                &input[blk_idx * Q5_K_BLOCK_ELEMENTS..(blk_idx + 1) * Q5_K_BLOCK_ELEMENTS];
+            row_sum += dot_product_f32_scalar(&dequant_buf, input_sub);
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `Q5_K` quantized weights using RVV vector dot product.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q5_K` or dimensions mismatch.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub fn vec_dot_q5_k_rvv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) = validate_q5_k_dimensions(output.len(), weights, input.len())?;
+    let blocks_per_row = cols / Q5_K_BLOCK_ELEMENTS;
+    let raw_bytes = weights.as_bytes();
+    let mut dequant_buf = [0.0_f32; Q5_K_BLOCK_ELEMENTS];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let mut row_sum = 0.0_f32;
+        for blk_idx in 0..blocks_per_row {
+            let block_index = row * blocks_per_row + blk_idx;
+            let byte_start = block_index * Q5_K_BLOCK_BYTES;
+            let byte_end = byte_start + Q5_K_BLOCK_BYTES;
+            let block_slice: &[u8; Q5_K_BLOCK_BYTES] = raw_bytes[byte_start..byte_end]
+                .try_into()
+                .map_err(|_| K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: byte_start,
+                byte_len: Q5_K_BLOCK_BYTES,
+                buffer_len: raw_bytes.len(),
+                reason: "failed to slice Q5_K block".to_owned(),
+            })?;
+
+            dequantize_q5_k_block(block_slice, &mut dequant_buf);
+            let input_sub =
+                &input[blk_idx * Q5_K_BLOCK_ELEMENTS..(blk_idx + 1) * Q5_K_BLOCK_ELEMENTS];
+            row_sum += dot_product_f32_rvv(&dequant_buf, input_sub);
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `Q5_K` quantized weights.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q5_K` or dimensions mismatch.
+pub fn vec_dot_q5_k(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        vec_dot_q5_k_rvv(output, weights, input)
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        vec_dot_q5_k_scalar(output, weights, input)
+    }
+}
+
+/// Computes matrix-vector multiplication with `Q5_K` quantized weights (`y = W * x`).
+///
+/// Convenience entry point matching Issue #40 signature.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if dimensions do not align or weights are malformed.
+pub fn matvec_q5_k(
+    weights: &TensorView<'_>,
+    input: &[f32],
+    output: &mut [f32],
+) -> Result<(), K3Error> {
+    vec_dot_q5_k(output, weights, input)
+}
+
+/// Computes matrix-vector multiplication for a slice of [`BlockQ5_K`] structs.
+///
+/// # Panics
+///
+/// Panics if `cols % 256 != 0`, `weights.len() != rows * (cols / 256)`,
+/// `x.len() < cols`, or `out.len() < rows`.
+pub fn matvec_q5_k_slice(
+    weights: &[BlockQ5_K],
+    x: &[f32],
+    out: &mut [f32],
+    rows: usize,
+    cols: usize,
+) {
+    assert!(
+        cols % Q5_K_BLOCK_ELEMENTS == 0,
+        "cols must be a multiple of 256"
+    );
+    let blocks_per_row = cols / Q5_K_BLOCK_ELEMENTS;
+    assert_eq!(
+        weights.len(),
+        rows * blocks_per_row,
+        "weight block count mismatch"
+    );
+    assert!(x.len() >= cols, "input slice too short");
+    assert!(out.len() >= rows, "output slice too short");
+
+    let mut dequant_buf = [0.0_f32; Q5_K_BLOCK_ELEMENTS];
+
+    for (row, out_slot) in out.iter_mut().enumerate().take(rows) {
+        let mut row_sum = 0.0_f32;
+        for blk_idx in 0..blocks_per_row {
+            let block = &weights[row * blocks_per_row + blk_idx];
+            dequantize_q5_k_block_struct(block, &mut dequant_buf);
+            let input_sub = &x[blk_idx * Q5_K_BLOCK_ELEMENTS..(blk_idx + 1) * Q5_K_BLOCK_ELEMENTS];
+            #[cfg(all(target_arch = "riscv64", not(miri)))]
+            {
+                row_sum += dot_product_f32_rvv(&dequant_buf, input_sub);
+            }
+            #[cfg(any(not(target_arch = "riscv64"), miri))]
+            {
+                row_sum += dot_product_f32_scalar(&dequant_buf, input_sub);
+            }
+        }
+        *out_slot = row_sum;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +876,66 @@ mod tests {
 
         // Sum of 256 * (-30.0) = -7680
         assert!((dot_out[0] - (-7680.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_dequantize_q5_k_block_and_vec_dot() {
+        let mut raw = [0u8; Q5_K_BLOCK_BYTES];
+        // d = 1.0 (0x3C00), dmin = 0.5 (0x3800)
+        raw[0..2].copy_from_slice(&0x3C00_u16.to_le_bytes());
+        raw[2..4].copy_from_slice(&0x3800_u16.to_le_bytes());
+
+        raw[4] = 2;
+        raw[8] = 1;
+        raw[5] = 3;
+        raw[9] = 2;
+        raw[6] = 4;
+        raw[10] = 3;
+        raw[7] = 5;
+        raw[11] = 4;
+
+        for b in &mut raw[16..48] {
+            *b = 0x09;
+        }
+        for b in &mut raw[48..80] {
+            *b = 0x53;
+        }
+        for b in &mut raw[80..112] {
+            *b = 0x24;
+        }
+
+        let mut out = [0.0_f32; Q5_K_BLOCK_ELEMENTS];
+        dequantize_q5_k_block(&raw, &mut out);
+
+        let sum: f32 = out.iter().sum();
+        assert!((sum - 4928.0).abs() < 1e-3);
+
+        let view = TensorView::from_bytes("test_q5_k", QuantType::Q5_K, &[1, 256], 0, &raw)
+            .expect("valid Q5_K view");
+        let input = [1.0_f32; 256];
+        let mut dot_out = [0.0_f32; 1];
+        matvec_q5_k(&view, &input, &mut dot_out).expect("matvec_q5_k succeeds");
+        assert!((dot_out[0] - 4928.0).abs() < 1e-3);
+
+        // Also test matvec_q5_k_slice
+        let block_struct = BlockQ5_K {
+            d: 0x3C00,
+            dmin: 0x3800,
+            scales: [2, 3, 4, 5, 1, 2, 3, 4, 0, 0, 0, 0],
+            qh: [0x09; 32],
+            qs: {
+                let mut qs = [0u8; 128];
+                for b in &mut qs[0..32] {
+                    *b = 0x53;
+                }
+                for b in &mut qs[32..64] {
+                    *b = 0x24;
+                }
+                qs
+            },
+        };
+        let mut slice_out = [0.0_f32; 1];
+        matvec_q5_k_slice(&[block_struct], &input, &mut slice_out, 1, 256);
+        assert!((slice_out[0] - 4928.0).abs() < 1e-3);
     }
 }
