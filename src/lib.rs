@@ -9,7 +9,9 @@ use k3_core::{K3Error, QuantType, TensorView};
 
 pub mod attention;
 pub mod ime;
+pub mod norm;
 pub mod quant;
+pub mod residual;
 pub mod rope;
 pub mod swiglu;
 
@@ -18,6 +20,12 @@ pub use ime::{
     TQ1_0_BLOCK_BYTES, TQ1_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES, TQ2_0_BLOCK_ELEMENTS,
     bitlinear_i8_ime, bitlinear_i8_rvv, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8,
 };
+pub use norm::{
+    l2_norm_f32, l2_norm_f32_in_place, l2_norm_f32_in_place_scalar, l2_norm_f32_scalar,
+    l2_norm_inplace_f32,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use norm::{l2_norm_f32_in_place_rvv, l2_norm_f32_rvv};
 pub use quant::{
     Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
     dequantize_q6_k_block, dequantize_q8_0_block, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0,
@@ -25,6 +33,15 @@ pub use quant::{
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use quant::{vec_dot_q6_k_rvv, vec_dot_q8_0_rvv};
+pub use residual::{
+    ngpt_residual_lerp_f32, ngpt_residual_lerp_f32_scalar, ngpt_residual_lerp_in_place,
+    ngpt_residual_lerp_in_place_scalar, ngpt_residual_lerp_inplace_f32,
+    ngpt_residual_lerp_inplace_scalar,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use residual::{
+    ngpt_residual_lerp_f32_rvv, ngpt_residual_lerp_in_place_rvv, ngpt_residual_lerp_inplace_rvv,
+};
 pub use rope::{
     RopeScalingConfig, apply_rope_inplace, apply_rope_with_inv_freq, precompute_rope_inv_freq,
 };
