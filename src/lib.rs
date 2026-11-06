@@ -27,12 +27,14 @@ pub use norm::{
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::{l2_norm_f32_in_place_rvv, l2_norm_f32_rvv};
 pub use quant::{
-    Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
-    dequantize_q6_k_block, dequantize_q8_0_block, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0,
-    vec_dot_q8_0_scalar,
+    Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES,
+    Q8_0_BLOCK_ELEMENTS, dequantize_q5_k_block, dequantize_q5_k_block_struct,
+    dequantize_q6_k_block, dequantize_q8_0_block, matvec_q5_k, matvec_q5_k_slice,
+    validate_q5_k_dimensions, vec_dot_q5_k, vec_dot_q5_k_scalar, vec_dot_q6_k, vec_dot_q6_k_scalar,
+    vec_dot_q8_0, vec_dot_q8_0_scalar,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
-pub use quant::{vec_dot_q6_k_rvv, vec_dot_q8_0_rvv};
+pub use quant::{vec_dot_q5_k_rvv, vec_dot_q6_k_rvv, vec_dot_q8_0_rvv};
 pub use residual::{
     ngpt_residual_lerp_f32, ngpt_residual_lerp_f32_scalar, ngpt_residual_lerp_in_place,
     ngpt_residual_lerp_in_place_scalar, ngpt_residual_lerp_inplace_f32,
@@ -101,6 +103,18 @@ pub trait VectorKernel: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`K3Error::TensorBoundsError`] if dimensions do not align or weights are malformed.
     fn vec_dot_q6_k(
+        &self,
+        output: &mut [f32],
+        weights: &TensorView<'_>,
+        input: &[f32],
+    ) -> Result<(), K3Error>;
+
+    /// Computes matrix-vector multiplication with `Q5_K` quantized weights.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if dimensions do not align or weights are malformed.
+    fn vec_dot_q5_k(
         &self,
         output: &mut [f32],
         weights: &TensorView<'_>,
@@ -194,6 +208,22 @@ impl VectorKernel for BaselineKernel {
         #[cfg(any(not(target_arch = "riscv64"), miri))]
         {
             vec_dot_q6_k_scalar(output, weights, input)
+        }
+    }
+
+    fn vec_dot_q5_k(
+        &self,
+        output: &mut [f32],
+        weights: &TensorView<'_>,
+        input: &[f32],
+    ) -> Result<(), K3Error> {
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            vec_dot_q5_k_rvv(output, weights, input)
+        }
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
+        {
+            vec_dot_q5_k_scalar(output, weights, input)
         }
     }
 }
