@@ -4,7 +4,7 @@
 //! (`n_heads_kv == 1`), and Grouped-Query Attention (`n_heads_q % n_heads_kv == 0`)
 //! with numerically stable softmax and token-interleaved KV cache indexing.
 
-use k3_core::K3Error;
+use jero_core::K3Error;
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::dot_product_f32_rvv;

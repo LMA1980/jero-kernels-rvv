@@ -4,8 +4,8 @@
     reason = "test indices and dimensions fit in f32"
 )]
 
-use k3_core::{QuantType, TensorView};
-use kernels_rvv::{
+use jero_core::{QuantType, TensorView};
+use jero_kernels_rvv::{
     BaselineKernel, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
     RopeScalingConfig, VectorKernel, apply_rope_inplace, bf16_to_f32_finite, dequantize_q6_k_block,
     dequantize_q8_0_block, gqa_causal_attention_f32, precompute_rope_inv_freq, swiglu_f32,

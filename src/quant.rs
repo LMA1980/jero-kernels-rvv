@@ -3,7 +3,7 @@
 //! Provides bit-equivalent dequantization routines matching GGUF / `llama.cpp` definitions
 //! and matrix-vector dot dispatchers for both VLA RVV 1.0 and portable scalar execution.
 
-use k3_core::{BlockQ5_K, K3Error, QuantType, TensorView};
+use jero_core::{BlockQ5_K, K3Error, QuantType, TensorView};
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::dot_product_f32_rvv;

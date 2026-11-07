@@ -5,12 +5,12 @@
     reason = "test constants and assertions"
 )]
 
-use k3_core::{K3Error, QuantType, TensorView};
-use kernels_rvv::ime::{
+use jero_core::{K3Error, QuantType, TensorView};
+use jero_kernels_rvv::ime::{
     TQ1_0_BLOCK_BYTES, TQ1_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES, TQ2_0_BLOCK_ELEMENTS,
     bitlinear_i8_ime, bitlinear_i8_rvv, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8,
 };
-use kernels_rvv::{relu_squared_gate_f32, relu_squared_gate_scalar, subln_quantize_absmax_i8};
+use jero_kernels_rvv::{relu_squared_gate_f32, relu_squared_gate_scalar, subln_quantize_absmax_i8};
 
 // ============================================================================
 // 1. test_unpack_tq1_0_and_tq2_0

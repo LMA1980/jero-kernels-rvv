@@ -1,5 +1,6 @@
 version: "3"
-name: "k3-kernels-rvv declarative pipeline: Hygiene, Build, Test, Coverage, Miri & Benchmarks"
+name: "jero-kernels-rvv 3-Tier Declarative Pipeline: Hygiene, Build, Test, Coverage & Miri"
+sccache: try
 
 env:
   CARGO_TERM_COLOR: "always"

@@ -6,7 +6,7 @@
 //! `L2Norm(a + |alpha| * (b - a))`
 //! where `a = L2Norm(residual)` and `b = L2Norm(cur)`.
 
-use k3_core::K3Error;
+use jero_core::K3Error;
 
 /// Computes residual linear interpolation on two slices into a separate output slice:
 /// `out[i] = (1 - alpha) * residual[i] + alpha * update[i]`

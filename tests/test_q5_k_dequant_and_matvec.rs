@@ -1,5 +1,5 @@
 //! Integration and Property Test Suite for Issue #40 (Milestone 5):
-//! `dequantize_q5_k_block` and `matvec_q5_k` in `k3-kernels-rvv`.
+//! `dequantize_q5_k_block` and `matvec_q5_k` in `jero-kernels-rvv`.
 //!
 //! Objectives:
 //! 1. Memory layout and byte-level constants (176 bytes per block, 256 elements).
@@ -20,8 +20,8 @@
 )]
 
 use core::mem::{align_of, offset_of, size_of};
-use k3_core::{BlockQ5_K, K3Error, QuantType, TensorView};
-use kernels_rvv::{Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, dequantize_q5_k_block, matvec_q5_k};
+use jero_core::{BlockQ5_K, K3Error, QuantType, TensorView};
+use jero_kernels_rvv::{Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, dequantize_q5_k_block, matvec_q5_k};
 
 // ============================================================================
 // Independent GGML Reference Dequantization Oracle

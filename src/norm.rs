@@ -5,7 +5,7 @@
 //! with defensive zero-norm clamping and subnormal protection.
 //! Includes RVV 1.0 VLA strip-mining vector implementations and portable scalar fallbacks.
 
-use k3_core::K3Error;
+use jero_core::K3Error;
 
 /// Computes parameter-free unit hyperspherical normalization into a separate output slice:
 /// `out_i = x_i / sqrt(sum(x_k^2) + eps)`

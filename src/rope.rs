@@ -4,7 +4,7 @@
 //! VLA RVV 1.0 (`zvl256b`/`zvl1024b`) strip-mining and portable scalar fallbacks.
 
 use core::f32::consts::PI;
-use k3_core::K3Error;
+use jero_core::K3Error;
 
 /// Configuration for `RoPE` frequency scaling methods.
 #[derive(Debug, Clone, PartialEq)]

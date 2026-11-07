@@ -13,7 +13,7 @@
 //! `8 x 8` `i32` product `C[i][j] += sum_k A[i][k] * B[j][k]` into `v0:v1` (64 `i32` elements,
 //! row-major).
 
-use k3_core::{K3Error, QuantType, TensorView};
+use jero_core::{K3Error, QuantType, TensorView};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
