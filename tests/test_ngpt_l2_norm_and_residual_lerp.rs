@@ -18,8 +18,8 @@
     reason = "test indices, lengths, and floats fit in f32"
 )]
 
-use k3_core::K3Error;
-use kernels_rvv::{
+use jero_core::K3Error;
+use jero_kernels_rvv::{
     l2_norm_f32, l2_norm_f32_in_place, l2_norm_f32_in_place_scalar, l2_norm_f32_scalar,
     l2_norm_inplace_f32, ngpt_residual_lerp_f32, ngpt_residual_lerp_f32_scalar,
     ngpt_residual_lerp_in_place, ngpt_residual_lerp_in_place_scalar,

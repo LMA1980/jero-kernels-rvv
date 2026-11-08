@@ -1,6 +1,6 @@
-name = "kernels-rvv"
-# Crate-embedded Symposium manifest for kernels-rvv.
+name = "jero-kernels-rvv"
+# Crate-embedded Symposium manifest for jero-kernels-rvv.
 
 [[plugins]]
-depends-on = ["k3-core"]
-source.cargo = "k3-core"
+depends-on = ["jero-core"]
+source.cargo = "jero-core"

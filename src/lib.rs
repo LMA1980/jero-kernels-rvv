@@ -1,11 +1,11 @@
-//! `kernels-rvv`: VLA RVV 1.0 compute kernels and portable scalar fallbacks.
+//! `jero-kernels-rvv`: VLA RVV 1.0 compute kernels and portable scalar fallbacks.
 //!
 //! Provides vector primitives (dot product, `RMSNorm`, and `Q4_K_M` block dequantization /
 //! matrix-vector dot product) designed for RISC-V RVV 1.0 vector-length agnostic (`VLA`)
 //! strip-mining loops compatible with both `zvl256b` (`X100`) and `zvl1024b` (`A100`) per ADR-029,
 //! alongside bit-equivalent portable scalar fallbacks for cross-platform verification.
 
-use k3_core::{K3Error, QuantType, TensorView};
+use jero_core::{K3Error, QuantType, TensorView};
 
 pub mod attention;
 pub mod ime;

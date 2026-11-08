@@ -1,9 +1,9 @@
 ---
-name: kernels-rvv-ime
-description: "Write and verify VLA RVV 1.0 vector kernels, SpacemiT K3 A100 XSMTVDotII matrix instructions (smt.vpack.vv / smt.vmadot), and portable scalar fallbacks in kernels-rvv."
+name: jero-kernels-rvv
+description: "Write and verify VLA RVV 1.0 vector kernels, SpacemiT K3 A100 XSMTVDotII matrix instructions (smt.vpack.vv / smt.vmadot), and portable scalar fallbacks in jero-kernels-rvv."
 ---
 
-# `kernels-rvv` VLA RVV 1.0 & `XSMTVDotII` Matrix Kernel Invariants
+# `jero-kernels-rvv` VLA RVV 1.0 & `XSMTVDotII` Matrix Kernel Invariants
 
 ## 1. Variable-Length Agnostic (VLA) RVV 1.0 Strip-Mining
 

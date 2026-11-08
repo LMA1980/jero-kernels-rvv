@@ -3,7 +3,7 @@
 //! Provides numerically stable `SiLU(gate) * up` gated activations and non-poisoning
 //! BF16-to-F32 conversions that guarantee deterministic execution across transformer forward passes.
 
-use k3_core::K3Error;
+use jero_core::K3Error;
 
 /// Converts a 16-bit brain floating-point (`BF16`) bit pattern to single-precision `f32`.
 ///
