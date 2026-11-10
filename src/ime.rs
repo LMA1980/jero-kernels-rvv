@@ -842,9 +842,9 @@ mod tests {
     }
 
     #[expect(clippy::cast_possible_truncation, reason = "bounded modulo 17")]
-    fn fill(len: usize, salt: usize) -> Vec<i8> {
+    fn fill(len: usize, seed: usize) -> Vec<i8> {
         (0..len)
-            .map(|i| (((i * 7 + salt * 13) % 17) as i8) - 8)
+            .map(|i| (((i * 7 + seed * 13) % 17) as i8) - 8)
             .collect()
     }
 
