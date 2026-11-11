@@ -29,19 +29,19 @@ tasks:
     tool: "cargo-build"
     args: ["--release"]
     timeout_seconds: 1800
-    sandbox_profile: "k3_hardware_bench"
+    sandbox_profile: "default_ci"
 
   test-task:
     tool: "cargo-test"
     args: ["--lib", "--bins", "--tests"]
     timeout_seconds: 1800
-    sandbox_profile: "k3_hardware_bench"
+    sandbox_profile: "default_ci"
 
   coverage-task:
     tool: "cargo-llvm-cov"
     args: ["--summary-only"]
     timeout_seconds: 1800
-    sandbox_profile: "k3_hardware_bench"
+    sandbox_profile: "default_ci"
 
   miri-task:
     tool: "cargo-miri"
@@ -95,7 +95,7 @@ stages:
     depends_on: ["build-release"]
     tags: ["test"]
     threads: 6
-    exclusive: true
+    exclusive: false
     max_concurrent_per_node: 1
 
   - id: coverage-check
@@ -104,7 +104,7 @@ stages:
     depends_on: ["test-check", "audit-check"]
     tags: ["test"]
     threads: 6
-    exclusive: true
+    exclusive: false
     max_concurrent_per_node: 1
 
   - id: miri-check

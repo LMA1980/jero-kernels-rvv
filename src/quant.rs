@@ -1,14 +1,22 @@
-//! Block dequantization and quantized vector dot product primitives for `Q8_0`, `Q6_K`, and `Q5_K`.
+//! Block dequantization and quantized vector dot product primitives for `Q4_0`, `Q8_0`, `Q6_K`,
+//! `Q5_K`, `F16`, and `BF16`.
 //!
 //! Provides bit-equivalent dequantization routines matching GGUF / `llama.cpp` definitions
 //! and matrix-vector dot dispatchers for both VLA RVV 1.0 and portable scalar execution.
 
 use jero_core::{BlockQ5_K, K3Error, QuantType, TensorView};
 
+use crate::bf16_to_f32_finite;
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::dot_product_f32_rvv;
 use crate::dot_product_f32_scalar;
-use crate::f16_to_f32_finite;
+pub use crate::f16_to_f32_finite;
+
+/// Number of scalar elements in a single `Q4_0` block.
+pub const Q4_0_BLOCK_ELEMENTS: usize = 32;
+
+/// Storage size in bytes of a single `Q4_0` block (2B `f16` scale + 16B packed 4-bit nibbles).
+pub const Q4_0_BLOCK_BYTES: usize = 18;
 
 /// Number of scalar elements in a single `Q8_0` block.
 pub const Q8_0_BLOCK_ELEMENTS: usize = 32;
@@ -27,6 +35,28 @@ pub const Q5_K_BLOCK_ELEMENTS: usize = 256;
 
 /// Storage size in bytes of a single `Q5_K` super-block.
 pub const Q5_K_BLOCK_BYTES: usize = 176;
+
+/// Dequantizes an 18-byte `Q4_0` block (2B `f16` scale + 16 packed nibble bytes) into 32 `f32` elements
+/// matching GGML `dequantize_row_q4_0` (`out[0..16]` from low nibbles, `out[16..32]` from high nibbles).
+pub fn dequantize_q4_0_block(block: &[u8; Q4_0_BLOCK_BYTES], out: &mut [f32; Q4_0_BLOCK_ELEMENTS]) {
+    let d_bits = u16::from_le_bytes([block[0], block[1]]);
+    let d = f16_to_f32_finite(d_bits);
+
+    if d == 0.0 {
+        out.fill(0.0);
+        return;
+    }
+
+    for i in 0..16 {
+        let byte = block[2 + i];
+        #[expect(clippy::cast_possible_wrap, reason = "4-bit nibble offset by -8")]
+        let q0 = ((byte & 0x0F) as i8) - 8;
+        #[expect(clippy::cast_possible_wrap, reason = "4-bit nibble offset by -8")]
+        let q1 = (((byte >> 4) & 0x0F) as i8) - 8;
+        out[i] = d * f32::from(q0);
+        out[i + 16] = d * f32::from(q1);
+    }
+}
 
 /// Dequantizes a 34-byte `Q8_0` block (2B `f16` scale + 32 signed `i8` values) into 32 `f32` elements.
 pub fn dequantize_q8_0_block(block: &[u8; Q8_0_BLOCK_BYTES], out: &mut [f32; Q8_0_BLOCK_ELEMENTS]) {
@@ -394,6 +424,62 @@ pub fn vec_dot_q8_0_scalar(
     Ok(())
 }
 
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[inline]
+#[allow(unused_assignments)]
+fn dot_i8_32_f32_rvv(quants: &[u8], input: &[f32]) -> f32 {
+    debug_assert!(quants.len() >= Q8_0_BLOCK_ELEMENTS);
+    debug_assert!(input.len() >= Q8_0_BLOCK_ELEMENTS);
+    let mut pq = quants.as_ptr();
+    let mut px = input.as_ptr();
+    let mut rem = Q8_0_BLOCK_ELEMENTS;
+    let zero_f = 0.0_f32;
+    let sum: f32;
+
+    // SAFETY: `pq` points to 32 valid signed bytes and `px` points to at least 32 `f32`s.
+    // Strip-mined `e32, m4` (`vle8.v` -> `vsext.vf4` -> `vfcvt.f.x.v` -> `vfmul.vv` -> `vfredusum.vs`)
+    // executes in 1 vector iteration on both `zvl256b` (`X100`) and `zvl1024b` (`A100`).
+    unsafe {
+        core::arch::asm!(
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.s.f v0, {z}",
+            "2:",
+            "vsetvli t0, {rem}, e32, m4, ta, ma",
+            "vle8.v v8, ({pq})",
+            "vsext.vf4 v12, v8",
+            "vfcvt.f.x.v v12, v12",
+            "vle32.v v16, ({px})",
+            "vfmul.vv v12, v12, v16",
+            "vfredusum.vs v0, v12, v0",
+            "add {pq}, {pq}, t0",
+            "slli t1, t0, 2",
+            "add {px}, {px}, t1",
+            "sub {rem}, {rem}, t0",
+            "bnez {rem}, 2b",
+            "vfmv.f.s {sum}, v0",
+            pq = inout(reg) pq,
+            px = inout(reg) px,
+            rem = inout(reg) rem,
+            z = in(freg) zero_f,
+            sum = out(freg) sum,
+            out("t0") _,
+            out("t1") _,
+            out("v0") _,
+            out("v8") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            options(nostack, readonly),
+        );
+    }
+    sum
+}
+
 /// Computes matrix-vector multiplication with `Q8_0` quantized weights using RVV vector dot product.
 ///
 /// # Errors
@@ -408,7 +494,6 @@ pub fn vec_dot_q8_0_rvv(
     let (rows, cols) = validate_q8_0_dimensions(output.len(), weights, input.len())?;
     let blocks_per_row = cols / Q8_0_BLOCK_ELEMENTS;
     let raw_bytes = weights.as_bytes();
-    let mut dequant_buf = [0.0_f32; Q8_0_BLOCK_ELEMENTS];
 
     for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
         let mut row_sum = 0.0_f32;
@@ -416,20 +501,23 @@ pub fn vec_dot_q8_0_rvv(
             let block_index = row * blocks_per_row + blk_idx;
             let byte_start = block_index * Q8_0_BLOCK_BYTES;
             let byte_end = byte_start + Q8_0_BLOCK_BYTES;
-            let block_slice: &[u8; Q8_0_BLOCK_BYTES] = raw_bytes[byte_start..byte_end]
-                .try_into()
-                .map_err(|_| K3Error::TensorBoundsError {
-                tensor_name: weights.name().to_owned(),
-                offset: byte_start,
-                byte_len: Q8_0_BLOCK_BYTES,
-                buffer_len: raw_bytes.len(),
-                reason: "failed to slice Q8_0 block".to_owned(),
-            })?;
+            let block_slice: &[u8; Q8_0_BLOCK_BYTES] = raw_bytes
+                .get(byte_start..byte_end)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: weights.name().to_owned(),
+                    offset: byte_start,
+                    byte_len: Q8_0_BLOCK_BYTES,
+                    buffer_len: raw_bytes.len(),
+                    reason: "failed to slice Q8_0 block".to_owned(),
+                })?;
 
-            dequantize_q8_0_block(block_slice, &mut dequant_buf);
-            let input_sub =
-                &input[blk_idx * Q8_0_BLOCK_ELEMENTS..(blk_idx + 1) * Q8_0_BLOCK_ELEMENTS];
-            row_sum += dot_product_f32_rvv(&dequant_buf, input_sub);
+            let d = f16_to_f32_finite(u16::from_le_bytes([block_slice[0], block_slice[1]]));
+            if d != 0.0 {
+                let input_sub =
+                    &input[blk_idx * Q8_0_BLOCK_ELEMENTS..(blk_idx + 1) * Q8_0_BLOCK_ELEMENTS];
+                row_sum += d * dot_i8_32_f32_rvv(&block_slice[2..34], input_sub);
+            }
         }
         *out_slot = row_sum;
     }
@@ -801,6 +889,475 @@ pub fn matvec_q5_k_slice(
     }
 }
 
+pub(crate) fn validate_q4_0_dimensions(
+    output_len: usize,
+    weights: &TensorView<'_>,
+    input_len: usize,
+) -> Result<(usize, usize), K3Error> {
+    if weights.quant() != QuantType::Q4_0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!("expected Q4_0 quant type, got {:?}", weights.quant()),
+        });
+    }
+
+    let shape = weights.shape();
+    if shape.is_empty() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: "empty tensor shape".to_owned(),
+        });
+    }
+
+    let (rows, cols) = if shape.len() == 2 {
+        let dim0 = shape[0];
+        let dim1 = shape[1];
+        if output_len == dim0 && input_len == dim1 && dim1 % Q4_0_BLOCK_ELEMENTS == 0 {
+            (dim0, dim1)
+        } else if output_len == dim1 && input_len == dim0 && dim0 % Q4_0_BLOCK_ELEMENTS == 0 {
+            (dim1, dim0)
+        } else {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: weights.offset(),
+                byte_len: weights.byte_len(),
+                buffer_len: weights.as_bytes().len(),
+                reason: format!(
+                    "matrix shape [{dim0}, {dim1}] does not match output len {output_len} and Q4_0-aligned input len {input_len}"
+                ),
+            });
+        }
+    } else {
+        let total_elems = weights.num_elements();
+        if input_len == 0
+            || output_len == 0
+            || input_len % Q4_0_BLOCK_ELEMENTS != 0
+            || output_len * input_len != total_elems
+        {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: weights.offset(),
+                byte_len: weights.byte_len(),
+                buffer_len: weights.as_bytes().len(),
+                reason: format!(
+                    "tensor elements {total_elems} do not match output len {output_len} * input len {input_len}"
+                ),
+            });
+        }
+        (output_len, input_len)
+    };
+
+    let required_bytes = (rows * cols / Q4_0_BLOCK_ELEMENTS) * Q4_0_BLOCK_BYTES;
+    if weights.as_bytes().len() < required_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "Q4_0 buffer length {} < required {required_bytes}",
+                weights.as_bytes().len()
+            ),
+        });
+    }
+
+    Ok((rows, cols))
+}
+
+/// Computes matrix-vector multiplication with `Q4_0` quantized weights using portable scalar arithmetic.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q4_0` or dimensions mismatch.
+pub fn vec_dot_q4_0_scalar(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) = validate_q4_0_dimensions(output.len(), weights, input.len())?;
+    let blocks_per_row = cols / Q4_0_BLOCK_ELEMENTS;
+    let raw_bytes = weights.as_bytes();
+    let mut dequant_buf = [0.0_f32; Q4_0_BLOCK_ELEMENTS];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let mut row_sum = 0.0_f32;
+        for blk_idx in 0..blocks_per_row {
+            let block_index = row * blocks_per_row + blk_idx;
+            let byte_start = block_index * Q4_0_BLOCK_BYTES;
+            let byte_end = byte_start + Q4_0_BLOCK_BYTES;
+            let block_slice: &[u8; Q4_0_BLOCK_BYTES] = raw_bytes[byte_start..byte_end]
+                .try_into()
+                .map_err(|_| K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: byte_start,
+                byte_len: Q4_0_BLOCK_BYTES,
+                buffer_len: raw_bytes.len(),
+                reason: "failed to slice Q4_0 block".to_owned(),
+            })?;
+
+            dequantize_q4_0_block(block_slice, &mut dequant_buf);
+            let input_sub =
+                &input[blk_idx * Q4_0_BLOCK_ELEMENTS..(blk_idx + 1) * Q4_0_BLOCK_ELEMENTS];
+            row_sum += dot_product_f32_scalar(&dequant_buf, input_sub);
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `Q4_0` quantized weights using RVV vector dot product.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q4_0` or dimensions mismatch.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub fn vec_dot_q4_0_rvv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) = validate_q4_0_dimensions(output.len(), weights, input.len())?;
+    let blocks_per_row = cols / Q4_0_BLOCK_ELEMENTS;
+    let raw_bytes = weights.as_bytes();
+    let mut unpacked_i8 = [0_u8; Q4_0_BLOCK_ELEMENTS];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let mut row_sum = 0.0_f32;
+        for blk_idx in 0..blocks_per_row {
+            let block_index = row * blocks_per_row + blk_idx;
+            let byte_start = block_index * Q4_0_BLOCK_BYTES;
+            let byte_end = byte_start + Q4_0_BLOCK_BYTES;
+            let block_slice: &[u8; Q4_0_BLOCK_BYTES] = raw_bytes[byte_start..byte_end]
+                .try_into()
+                .map_err(|_| K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: byte_start,
+                byte_len: Q4_0_BLOCK_BYTES,
+                buffer_len: raw_bytes.len(),
+                reason: "failed to slice Q4_0 block".to_owned(),
+            })?;
+
+            let d = f16_to_f32_finite(u16::from_le_bytes([block_slice[0], block_slice[1]]));
+            if d != 0.0 {
+                for i in 0..16 {
+                    let byte = block_slice[2 + i];
+                    unpacked_i8[i] = (byte & 0x0F).wrapping_sub(8);
+                    unpacked_i8[i + 16] = ((byte >> 4) & 0x0F).wrapping_sub(8);
+                }
+                let input_sub =
+                    &input[blk_idx * Q4_0_BLOCK_ELEMENTS..(blk_idx + 1) * Q4_0_BLOCK_ELEMENTS];
+                row_sum += d * dot_i8_32_f32_rvv(&unpacked_i8, input_sub);
+            }
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `Q4_0` quantized weights.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `Q4_0` or dimensions mismatch.
+pub fn vec_dot_q4_0(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        vec_dot_q4_0_rvv(output, weights, input)
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        vec_dot_q4_0_scalar(output, weights, input)
+    }
+}
+
+fn validate_half_dimensions(
+    expected_quant: QuantType,
+    output_len: usize,
+    weights: &TensorView<'_>,
+    input_len: usize,
+) -> Result<(usize, usize), K3Error> {
+    if weights.quant() != expected_quant {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "expected {expected_quant:?} quant type, got {:?}",
+                weights.quant()
+            ),
+        });
+    }
+
+    let shape = weights.shape();
+    if shape.is_empty() {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: "empty tensor shape".to_owned(),
+        });
+    }
+
+    let (rows, cols) = if shape.len() == 2 {
+        let dim0 = shape[0];
+        let dim1 = shape[1];
+        if output_len == dim0 && input_len == dim1 {
+            (dim0, dim1)
+        } else if output_len == dim1 && input_len == dim0 {
+            (dim1, dim0)
+        } else {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: weights.offset(),
+                byte_len: weights.byte_len(),
+                buffer_len: weights.as_bytes().len(),
+                reason: format!(
+                    "matrix shape [{dim0}, {dim1}] does not match output len {output_len} and input len {input_len}"
+                ),
+            });
+        }
+    } else {
+        let total_elems = weights.num_elements();
+        if input_len == 0 || output_len == 0 || output_len * input_len != total_elems {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: weights.offset(),
+                byte_len: weights.byte_len(),
+                buffer_len: weights.as_bytes().len(),
+                reason: format!(
+                    "tensor elements {total_elems} do not match output len {output_len} * input len {input_len}"
+                ),
+            });
+        }
+        (output_len, input_len)
+    };
+
+    let required_bytes = rows
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: "half-precision byte length overflow".to_owned(),
+        })?;
+    if weights.as_bytes().len() < required_bytes {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: format!(
+                "{expected_quant:?} buffer length {} < required {required_bytes}",
+                weights.as_bytes().len()
+            ),
+        });
+    }
+
+    Ok((rows, cols))
+}
+
+/// Computes matrix-vector multiplication with `F16` weights using portable scalar arithmetic.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `F16` or dimensions mismatch.
+pub fn vec_dot_f16_scalar(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) =
+        validate_half_dimensions(QuantType::F16, output.len(), weights, input.len())?;
+    let raw_bytes = weights.as_bytes();
+    let stride_bytes = cols * 2;
+    let mut chunk_buf = [0.0_f32; 256];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let row_slice = &raw_bytes[row * stride_bytes..(row + 1) * stride_bytes];
+        let mut row_sum = 0.0_f32;
+        let mut col = 0usize;
+        while col < cols {
+            let n = (cols - col).min(chunk_buf.len());
+            for (i, slot) in chunk_buf.iter_mut().enumerate().take(n) {
+                let off = (col + i) * 2;
+                let bits = u16::from_le_bytes([row_slice[off], row_slice[off + 1]]);
+                *slot = f16_to_f32_finite(bits);
+            }
+            row_sum += dot_product_f32_scalar(&chunk_buf[..n], &input[col..col + n]);
+            col += n;
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `F16` weights using VLA RVV 1.0 dot product.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `F16` or dimensions mismatch.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub fn vec_dot_f16_rvv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) =
+        validate_half_dimensions(QuantType::F16, output.len(), weights, input.len())?;
+    let raw_bytes = weights.as_bytes();
+    let stride_bytes = cols * 2;
+    let mut chunk_buf = [0.0_f32; 256];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let row_slice = &raw_bytes[row * stride_bytes..(row + 1) * stride_bytes];
+        let mut row_sum = 0.0_f32;
+        let mut col = 0usize;
+        while col < cols {
+            let n = (cols - col).min(chunk_buf.len());
+            for (i, slot) in chunk_buf.iter_mut().enumerate().take(n) {
+                let off = (col + i) * 2;
+                let bits = u16::from_le_bytes([row_slice[off], row_slice[off + 1]]);
+                *slot = f16_to_f32_finite(bits);
+            }
+            row_sum += dot_product_f32_rvv(&chunk_buf[..n], &input[col..col + n]);
+            col += n;
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `F16` half-precision weights.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `F16` or dimensions mismatch.
+pub fn vec_dot_f16(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        vec_dot_f16_rvv(output, weights, input)
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        vec_dot_f16_scalar(output, weights, input)
+    }
+}
+
+/// Computes matrix-vector multiplication with `BF16` weights using portable scalar arithmetic.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `BF16` or dimensions mismatch.
+pub fn vec_dot_bf16_scalar(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) =
+        validate_half_dimensions(QuantType::BF16, output.len(), weights, input.len())?;
+    let raw_bytes = weights.as_bytes();
+    let stride_bytes = cols * 2;
+    let mut chunk_buf = [0.0_f32; 256];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let row_slice = &raw_bytes[row * stride_bytes..(row + 1) * stride_bytes];
+        let mut row_sum = 0.0_f32;
+        let mut col = 0usize;
+        while col < cols {
+            let n = (cols - col).min(chunk_buf.len());
+            for (i, slot) in chunk_buf.iter_mut().enumerate().take(n) {
+                let off = (col + i) * 2;
+                let bits = u16::from_le_bytes([row_slice[off], row_slice[off + 1]]);
+                *slot = bf16_to_f32_finite(bits);
+            }
+            row_sum += dot_product_f32_scalar(&chunk_buf[..n], &input[col..col + n]);
+            col += n;
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `BF16` weights using VLA RVV 1.0 dot product.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `BF16` or dimensions mismatch.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub fn vec_dot_bf16_rvv(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    let (rows, cols) =
+        validate_half_dimensions(QuantType::BF16, output.len(), weights, input.len())?;
+    let raw_bytes = weights.as_bytes();
+    let stride_bytes = cols * 2;
+    let mut chunk_buf = [0.0_f32; 256];
+
+    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
+        let row_slice = &raw_bytes[row * stride_bytes..(row + 1) * stride_bytes];
+        let mut row_sum = 0.0_f32;
+        let mut col = 0usize;
+        while col < cols {
+            let n = (cols - col).min(chunk_buf.len());
+            for (i, slot) in chunk_buf.iter_mut().enumerate().take(n) {
+                let off = (col + i) * 2;
+                let bits = u16::from_le_bytes([row_slice[off], row_slice[off + 1]]);
+                *slot = bf16_to_f32_finite(bits);
+            }
+            row_sum += dot_product_f32_rvv(&chunk_buf[..n], &input[col..col + n]);
+            col += n;
+        }
+        *out_slot = row_sum;
+    }
+
+    Ok(())
+}
+
+/// Computes matrix-vector multiplication with `BF16` brain floating-point weights.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if quantization is not `BF16` or dimensions mismatch.
+pub fn vec_dot_bf16(
+    output: &mut [f32],
+    weights: &TensorView<'_>,
+    input: &[f32],
+) -> Result<(), K3Error> {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        vec_dot_bf16_rvv(output, weights, input)
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        vec_dot_bf16_scalar(output, weights, input)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,5 +1494,64 @@ mod tests {
         let mut slice_out = [0.0_f32; 1];
         matvec_q5_k_slice(&[block_struct], &input, &mut slice_out, 1, 256);
         assert!((slice_out[0] - 4928.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_dequantize_q4_0_block_and_vec_dot() {
+        let mut raw = [0u8; Q4_0_BLOCK_BYTES];
+        // d = 0.5 in f16 (0x3800)
+        raw[0..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        // Low nibbles = 10 -> q0 = +2, high nibbles = 5 -> q1 = -3
+        for b in &mut raw[2..18] {
+            *b = (0x05_u8 << 4) | 0x0A_u8;
+        }
+
+        let mut out = [0.0_f32; Q4_0_BLOCK_ELEMENTS];
+        dequantize_q4_0_block(&raw, &mut out);
+        assert!(out[..16].iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(out[16..].iter().all(|&v| (v - (-1.5)).abs() < 1e-6));
+
+        let view = TensorView::from_bytes("test_q4_0", QuantType::Q4_0, &[32, 1], 0, &raw)
+            .expect("valid Q4_0 view");
+        let input = [2.0_f32; 32];
+        let mut dot_out = [0.0_f32; 1];
+        vec_dot_q4_0(&mut dot_out, &view, &input).expect("vec_dot_q4_0 succeeds");
+        // 16 * (1.0 * 2.0) + 16 * (-1.5 * 2.0) = 32 - 48 = -16
+        assert!((dot_out[0] - (-16.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_vec_dot_f16_and_bf16() {
+        let cols = 19usize;
+        let rows = 2usize;
+        let mut half_bytes = vec![0u8; rows * cols * 2];
+        let mut bfloat_bytes = vec![0u8; rows * cols * 2];
+        for r in 0..rows {
+            for c in 0..cols {
+                let off = (r * cols + c) * 2;
+                // Row 0 = 1.0, Row 1 = -2.0
+                let half_bits: u16 = if r == 0 { 0x3C00 } else { 0xC000 };
+                let bfloat_bits: u16 = if r == 0 { 0x3F80 } else { 0xC000 };
+                half_bytes[off..off + 2].copy_from_slice(&half_bits.to_le_bytes());
+                bfloat_bytes[off..off + 2].copy_from_slice(&bfloat_bits.to_le_bytes());
+            }
+        }
+
+        let input = vec![0.5_f32; cols];
+        let shape = [cols, rows];
+        let half_view =
+            TensorView::from_bytes("w_f16", QuantType::F16, &shape, 0, &half_bytes).unwrap();
+        let bfloat_view =
+            TensorView::from_bytes("w_bf16", QuantType::BF16, &shape, 0, &bfloat_bytes).unwrap();
+
+        let mut half_out = [0.0_f32; 2];
+        let mut bfloat_out = [0.0_f32; 2];
+        vec_dot_f16(&mut half_out, &half_view, &input).expect("vec_dot_f16");
+        vec_dot_bf16(&mut bfloat_out, &bfloat_view, &input).expect("vec_dot_bf16");
+
+        assert!((half_out[0] - 9.5).abs() < 1e-4);
+        assert!((half_out[1] - (-19.0)).abs() < 1e-4);
+        assert!((bfloat_out[0] - 9.5).abs() < 1e-4);
+        assert!((bfloat_out[1] - (-19.0)).abs() < 1e-4);
     }
 }

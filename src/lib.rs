@@ -11,14 +11,18 @@ pub mod attention;
 pub mod ime;
 pub mod norm;
 pub mod quant;
+pub mod repack;
 pub mod residual;
 pub mod rope;
 pub mod swiglu;
 
 pub use attention::gqa_causal_attention_f32;
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use ime::tile_dot_rvv;
 pub use ime::{
     TQ1_0_BLOCK_BYTES, TQ1_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES, TQ2_0_BLOCK_ELEMENTS,
-    bitlinear_i8_ime, bitlinear_i8_rvv, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8,
+    bitlinear_i8_ime, bitlinear_i8_rvv, pack_tiles_aligned128, unpack_tq1_0_block_i8,
+    unpack_tq2_0_block_i8,
 };
 pub use norm::{
     l2_norm_f32, l2_norm_f32_in_place, l2_norm_f32_in_place_scalar, l2_norm_f32_scalar,
@@ -27,14 +31,27 @@ pub use norm::{
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::{l2_norm_f32_in_place_rvv, l2_norm_f32_rvv};
 pub use quant::{
-    Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES,
-    Q8_0_BLOCK_ELEMENTS, dequantize_q5_k_block, dequantize_q5_k_block_struct,
-    dequantize_q6_k_block, dequantize_q8_0_block, matvec_q5_k, matvec_q5_k_slice,
-    validate_q5_k_dimensions, vec_dot_q5_k, vec_dot_q5_k_scalar, vec_dot_q6_k, vec_dot_q6_k_scalar,
-    vec_dot_q8_0, vec_dot_q8_0_scalar,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
+    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, dequantize_q4_0_block,
+    dequantize_q5_k_block, dequantize_q5_k_block_struct, dequantize_q6_k_block,
+    dequantize_q8_0_block, matvec_q5_k, matvec_q5_k_slice, validate_q5_k_dimensions, vec_dot_bf16,
+    vec_dot_bf16_scalar, vec_dot_f16, vec_dot_f16_scalar, vec_dot_q4_0, vec_dot_q4_0_scalar,
+    vec_dot_q5_k, vec_dot_q5_k_scalar, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0,
+    vec_dot_q8_0_scalar,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
-pub use quant::{vec_dot_q5_k_rvv, vec_dot_q6_k_rvv, vec_dot_q8_0_rvv};
+pub use quant::{
+    vec_dot_bf16_rvv, vec_dot_f16_rvv, vec_dot_q4_0_rvv, vec_dot_q5_k_rvv, vec_dot_q6_k_rvv,
+    vec_dot_q8_0_rvv,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use repack::quantize_row_f32_to_q8_32_rvv;
+pub use repack::{
+    Aligned128, AlignedQuantMatrix, QuantizedActQ8, RepackedWeight, gemm_repacked,
+    gemm_repacked_f32, gemm_repacked_f32_rows, gemm_repacked_rows, gemm_repacked_vla_sim,
+    gemv_repacked, gemv_repacked_f32, gemv_repacked_f32_rows, gemv_repacked_rows,
+    quantize_row_f32_to_q8_32, quantize_row_f32_to_q8_32_scalar,
+};
 pub use residual::{
     ngpt_residual_lerp_f32, ngpt_residual_lerp_f32_scalar, ngpt_residual_lerp_in_place,
     ngpt_residual_lerp_in_place_scalar, ngpt_residual_lerp_inplace_f32,
@@ -342,8 +359,8 @@ pub fn dot_product_f32_vla_stripmined(a: &[f32], b: &[f32], vlen_bits: usize) ->
     acc
 }
 
-/// Computes the dot product of two `f32` slices using VLA RVV 1.0 inline assembly (`vsetvli`,
-/// `vle32.v`, `vfmul.vv`, `vfredusum.vs`) compatible with both `zvl256b` (`X100`) and `zvl1024b` (`A100`).
+/// Computes the dot product of two `f32` slices using a 4x-unrolled VLA RVV 1.0 `e32, m4`
+/// (`vfmacc.vv` + `vfredusum.vs`) loop compatible with both `zvl256b` (`X100`) and `zvl1024b` (`A100`).
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[must_use]
 #[allow(unused_assignments)]
@@ -356,36 +373,95 @@ pub fn dot_product_f32_rvv(a: &[f32], b: &[f32]) -> f32 {
     let mut ptr_a = a.as_ptr();
     let mut ptr_b = b.as_ptr();
     let mut rem = len;
-    let mut sum = 0.0_f32;
+    let sum: f32;
 
-    // SAFETY: Pointers `ptr_a` and `ptr_b` are valid for `rem` f32 elements.
-    // The RVV 1.0 loop uses `vsetvli` strip-mining (`e32, m1, ta, ma`) and ordered reduction
-    // `vfredusum.vs` into `v0[0]` to guarantee bit-identical results across VLEN=256 and VLEN=1024.
+    // SAFETY: `ptr_a` and `ptr_b` are valid for `rem` `f32` elements.
+    // Two independent `e32, m4` accumulators (`v0` and `v4`) unroll 4 `vlmax` chunks per loop
+    // iteration, followed by a `tu, ma` (tail-undisturbed) strip-mined tail loop and a final
+    // `vlmax` `vfredusum.vs` reduction into `v24[0]`.
     unsafe {
         core::arch::asm!(
-            "vsetvli t0, zero, e32, m1, ta, ma",
-            "vfmv.s.f v0, {sum}",
-            "2:",
-            "vsetvli t0, {rem}, e32, m1, ta, ma",
-            "vle32.v v1, ({pa})",
-            "vle32.v v2, ({pb})",
-            "vfmul.vv v1, v1, v2",
-            "vfredusum.vs v0, v1, v0",
+            "vsetvli t0, zero, e32, m4, ta, ma",
+            "vmv.v.i v0, 0",
+            "vmv.v.i v4, 0",
             "slli t1, t0, 2",
+            "slli t2, t0, 2",
+            "bltu {rem}, t2, 3f",
+            "2:",
+            "vle32.v v8, ({pa})",
+            "vle32.v v12, ({pb})",
             "add {pa}, {pa}, t1",
             "add {pb}, {pb}, t1",
-            "sub {rem}, {rem}, t0",
-            "bnez {rem}, 2b",
-            "vfmv.f.s {sum}, v0",
+            "vfmacc.vv v0, v8, v12",
+            "vle32.v v16, ({pa})",
+            "vle32.v v20, ({pb})",
+            "add {pa}, {pa}, t1",
+            "add {pb}, {pb}, t1",
+            "vfmacc.vv v4, v16, v20",
+            "vle32.v v8, ({pa})",
+            "vle32.v v12, ({pb})",
+            "add {pa}, {pa}, t1",
+            "add {pb}, {pb}, t1",
+            "vfmacc.vv v0, v8, v12",
+            "vle32.v v16, ({pa})",
+            "vle32.v v20, ({pb})",
+            "add {pa}, {pa}, t1",
+            "add {pb}, {pb}, t1",
+            "vfmacc.vv v4, v16, v20",
+            "sub {rem}, {rem}, t2",
+            "bgeu {rem}, t2, 2b",
+            "3:",
+            "vfadd.vv v0, v0, v4",
+            "beqz {rem}, 5f",
+            "4:",
+            "vsetvli t3, {rem}, e32, m4, tu, ma",
+            "vle32.v v8, ({pa})",
+            "vle32.v v12, ({pb})",
+            "vfmacc.vv v0, v8, v12",
+            "slli t1, t3, 2",
+            "add {pa}, {pa}, t1",
+            "add {pb}, {pb}, t1",
+            "sub {rem}, {rem}, t3",
+            "bnez {rem}, 4b",
+            "5:",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vmv.v.i v24, 0",
+            "vsetvli zero, t0, e32, m4, ta, ma",
+            "vfredusum.vs v24, v0, v24",
+            "vfmv.f.s {sum}, v24",
             pa = inout(reg) ptr_a,
             pb = inout(reg) ptr_b,
             rem = inout(reg) rem,
-            sum = inout(freg) sum,
+            sum = out(freg) sum,
             out("t0") _,
             out("t1") _,
+            out("t2") _,
+            out("t3") _,
             out("v0") _,
             out("v1") _,
             out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            out("v24") _,
             options(nostack, readonly),
         );
     }
