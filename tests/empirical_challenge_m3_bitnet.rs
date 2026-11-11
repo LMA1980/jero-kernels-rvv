@@ -737,9 +737,21 @@ fn test_challenge_m3_performance_and_throughput() {
     );
 
     // Assert that latency is comfortably within real-time budgets (< 100 microseconds per call in release, relaxed in unoptimized debug)
-    let max_subln = if cfg!(debug_assertions) { 1_000_000.0 } else { 100_000.0 };
-    let max_relu = if cfg!(debug_assertions) { 1_000_000.0 } else { 100_000.0 };
-    let max_bitlinear = if cfg!(debug_assertions) { 10_000_000.0 } else { 1_000_000.0 };
+    let max_subln = if cfg!(debug_assertions) {
+        1_000_000.0
+    } else {
+        100_000.0
+    };
+    let max_relu = if cfg!(debug_assertions) {
+        1_000_000.0
+    } else {
+        100_000.0
+    };
+    let max_bitlinear = if cfg!(debug_assertions) {
+        10_000_000.0
+    } else {
+        1_000_000.0
+    };
 
     assert!(
         subln_per_call < max_subln,
