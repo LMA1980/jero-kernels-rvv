@@ -18,6 +18,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::quant::{Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS};
+use crate::repack::Aligned128;
 
 /// Storage size in bytes of a single `TQ1_0` block (2B FP16 scale + 52B packed base-3 quants).
 pub const TQ1_0_BLOCK_BYTES: usize = 54;
@@ -66,7 +67,7 @@ pub const fn tile_count(rows: usize) -> usize {
     rows.div_ceil(TILE_M)
 }
 
-/// Packs a row-major `rows x k` `i8` matrix into `[row_tile][k_chunk][4][8]` tiles, zero-padding
+/// Packs a row-major `rows x k` `i8` matrix into `[row_tile][k_chunk][8][16]` tiles, zero-padding
 /// missing rows. `k` must be a multiple of [`TILE_K`].
 ///
 /// # Panics
@@ -89,14 +90,49 @@ pub fn pack_tiles(src: &[i8], rows: usize, k: usize) -> Vec<i8> {
     out
 }
 
-/// Portable scalar `4 x 4` tile product over `k_chunks` packed chunks.
+/// Packs a row-major `rows x k` `i8` matrix directly into `128-byte`-aligned [`Aligned128`] tiles
+/// (`[row_tile][k_chunk][8][16]`), zero-padding missing rows.
+///
+/// Each [`Aligned128`] element holds exactly one `8 x 16` `i8` tile (`128` bytes), simultaneously
+/// satisfying unit-stride vector load alignment on `X100` (`zvl256b`, `32B`) and `A100`
+/// (`zvl1024b`, `128B`) as well as `XSMTVDotII` (`smt.vmadot`) tile alignment.
+///
+/// # Panics
+///
+/// Panics if `k` is not a multiple of [`TILE_K`] or `src.len() != rows * k`.
 #[must_use]
-pub fn tile_dot_scalar(a: &[i8], b: &[i8], k_chunks: usize) -> [i32; TILE_C] {
-    let mut c = [0_i32; TILE_C];
+pub fn pack_tiles_aligned128(src: &[i8], rows: usize, k: usize) -> Vec<Aligned128> {
+    assert!(k % TILE_K == 0, "k must be a multiple of {TILE_K}");
+    assert_eq!(src.len(), rows * k, "source length must equal rows * k");
+    let k_chunks = k / TILE_K;
+    let mut out = vec![Aligned128::zeroed(); tile_count(rows) * k_chunks];
+    let out_i8 = Aligned128::slice_as_i8_mut(&mut out);
+    for row in 0..rows {
+        let (tile, r) = (row / TILE_M, row % TILE_M);
+        for chunk in 0..k_chunks {
+            let dst = (tile * k_chunks + chunk) * TILE_BYTES + r * TILE_K;
+            let s = row * k + chunk * TILE_K;
+            out_i8[dst..dst + TILE_K].copy_from_slice(&src[s..s + TILE_K]);
+        }
+    }
+    out
+}
+
+/// Portable scalar `8 x 8` tile product over `k_chunks` packed chunks for the first `active_m`
+/// rows of `a` (`0..=TILE_M`). Inactive rows `active_m..TILE_M` remain `0`.
+pub fn tile_dot_scalar_rows(
+    a: &[i8],
+    b: &[i8],
+    k_chunks: usize,
+    active_m: usize,
+    c: &mut [i32; TILE_C],
+) {
+    c.fill(0);
+    let m_bound = active_m.min(TILE_M);
     for chunk in 0..k_chunks {
         let at = &a[chunk * TILE_BYTES..(chunk + 1) * TILE_BYTES];
         let bt = &b[chunk * TILE_BYTES..(chunk + 1) * TILE_BYTES];
-        for i in 0..TILE_M {
+        for i in 0..m_bound {
             for j in 0..TILE_N {
                 for k in 0..TILE_K {
                     c[i * TILE_N + j] +=
@@ -105,6 +141,169 @@ pub fn tile_dot_scalar(a: &[i8], b: &[i8], k_chunks: usize) -> [i32; TILE_C] {
             }
         }
     }
+}
+
+/// Portable scalar `8 x 8` tile product over `k_chunks` packed chunks.
+#[must_use]
+pub fn tile_dot_scalar(a: &[i8], b: &[i8], k_chunks: usize) -> [i32; TILE_C] {
+    let mut c = [0_i32; TILE_C];
+    tile_dot_scalar_rows(a, b, k_chunks, TILE_M, &mut c);
+    c
+}
+
+/// RVV 1.0 `8 x 8` tile product over `k_chunks` packed chunks for the first `active_m` rows of `a`,
+/// compatible with both `X100` (`zvl256b`, `VLEN = 256`) and `A100` (`zvl1024b`, `VLEN = 1024`).
+///
+/// Uses standard RVV 1.0 widening `vwmul.vv` (`e8, m1 -> e16, m2`) and `vwredsum.vs` (`-> e32, m1`)
+/// without issuing any `XSMTVDotII` matrix instructions, producing exact `i32` sums bit-identical
+/// to [`tile_dot_ime`] and [`tile_dot_scalar`].
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[allow(unused_assignments)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "8-column unrolled RVV 1.0 widening tile inner loop"
+)]
+pub(crate) fn tile_dot_rvv_rows(
+    a: &[i8],
+    b: &[i8],
+    k_chunks: usize,
+    active_m: usize,
+    c: &mut [i32; TILE_C],
+) {
+    c.fill(0);
+    let m_bound = active_m.min(TILE_M);
+    if k_chunks == 0 || m_bound == 0 {
+        return;
+    }
+    let req_bytes = k_chunks * TILE_BYTES;
+    assert!(
+        a.len() >= req_bytes && b.len() >= req_bytes,
+        "tile slices shorter than k_chunks * TILE_BYTES"
+    );
+
+    for i in 0..m_bound {
+        // SAFETY: `a` and `b` hold at least `k_chunks * 128` bytes (`i < 8`), and `c` holds 64 `i32`s
+        // (`i * 8 + 8 <= 64`). `vsetivli zero, 16, e8, m1` sets `vl = 16` on all RVV 1.0 CPUs
+        // (`VLEN >= 128`), so both `X100` (`zvl256b`) and `A100` (`zvl1024b`) execute safely.
+        unsafe {
+            let mut pa = a.as_ptr().add(i * TILE_K);
+            let mut pb = b.as_ptr();
+            let mut n = k_chunks;
+            let pc = c.as_mut_ptr().add(i * TILE_N);
+            core::arch::asm!(
+                "vsetivli zero, 1, e32, m1, ta, ma",
+                "vmv.v.i v0, 0",
+                "vmv.v.i v1, 0",
+                "vmv.v.i v2, 0",
+                "vmv.v.i v3, 0",
+                "vmv.v.i v4, 0",
+                "vmv.v.i v5, 0",
+                "vmv.v.i v6, 0",
+                "vmv.v.i v7, 0",
+                "2:",
+                "vsetivli zero, 16, e8, m1, ta, ma",
+                "vle8.v v8, ({pa})",
+                "addi t0, {pb}, 16",
+                "addi t1, {pb}, 32",
+                "addi t2, {pb}, 48",
+                "vle8.v v9, ({pb})",
+                "vle8.v v10, (t0)",
+                "vle8.v v11, (t1)",
+                "vle8.v v12, (t2)",
+                "vwmul.vv v16, v8, v9",
+                "vwmul.vv v18, v8, v10",
+                "vwmul.vv v20, v8, v11",
+                "vwmul.vv v22, v8, v12",
+                "vsetivli zero, 16, e16, m2, ta, ma",
+                "vwredsum.vs v0, v16, v0",
+                "vwredsum.vs v1, v18, v1",
+                "vwredsum.vs v2, v20, v2",
+                "vwredsum.vs v3, v22, v3",
+                "vsetivli zero, 16, e8, m1, ta, ma",
+                "addi t0, {pb}, 64",
+                "addi t1, {pb}, 80",
+                "addi t2, {pb}, 96",
+                "addi t3, {pb}, 112",
+                "vle8.v v9, (t0)",
+                "vle8.v v10, (t1)",
+                "vle8.v v11, (t2)",
+                "vle8.v v12, (t3)",
+                "vwmul.vv v16, v8, v9",
+                "vwmul.vv v18, v8, v10",
+                "vwmul.vv v20, v8, v11",
+                "vwmul.vv v22, v8, v12",
+                "vsetivli zero, 16, e16, m2, ta, ma",
+                "vwredsum.vs v4, v16, v4",
+                "vwredsum.vs v5, v18, v5",
+                "vwredsum.vs v6, v20, v6",
+                "vwredsum.vs v7, v22, v7",
+                "addi {pa}, {pa}, 128",
+                "addi {pb}, {pb}, 128",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 2b",
+                "vsetivli zero, 1, e32, m1, ta, ma",
+                "vmv.x.s t0, v0",
+                "sw t0, 0({pc})",
+                "vmv.x.s t1, v1",
+                "sw t1, 4({pc})",
+                "vmv.x.s t2, v2",
+                "sw t2, 8({pc})",
+                "vmv.x.s t3, v3",
+                "sw t3, 12({pc})",
+                "vmv.x.s t0, v4",
+                "sw t0, 16({pc})",
+                "vmv.x.s t1, v5",
+                "sw t1, 20({pc})",
+                "vmv.x.s t2, v6",
+                "sw t2, 24({pc})",
+                "vmv.x.s t3, v7",
+                "sw t3, 28({pc})",
+                pa = inout(reg) pa,
+                pb = inout(reg) pb,
+                n = inout(reg) n,
+                pc = in(reg) pc,
+                out("t0") _,
+                out("t1") _,
+                out("t2") _,
+                out("t3") _,
+                out("v0") _,
+                out("v1") _,
+                out("v2") _,
+                out("v3") _,
+                out("v4") _,
+                out("v5") _,
+                out("v6") _,
+                out("v7") _,
+                out("v8") _,
+                out("v9") _,
+                out("v10") _,
+                out("v11") _,
+                out("v12") _,
+                out("v16") _,
+                out("v17") _,
+                out("v18") _,
+                out("v19") _,
+                out("v20") _,
+                out("v21") _,
+                out("v22") _,
+                out("v23") _,
+                options(nostack),
+            );
+        }
+    }
+}
+
+/// Full `8 x 8` tile product over `k_chunks` packed `8 x 16` chunks using standard RVV 1.0
+/// instructions (`X100` `zvl256b` and `A100` `zvl1024b` safe).
+///
+/// # Panics
+///
+/// Panics if `a.len() < k_chunks * TILE_BYTES` or `b.len() < k_chunks * TILE_BYTES`.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[must_use]
+pub fn tile_dot_rvv(a: &[i8], b: &[i8], k_chunks: usize) -> [i32; TILE_C] {
+    let mut c = [0_i32; TILE_C];
+    tile_dot_rvv_rows(a, b, k_chunks, TILE_M, &mut c);
     c
 }
 
@@ -117,7 +316,14 @@ pub fn tile_dot_scalar(a: &[i8], b: &[i8], k_chunks: usize) -> [i32; TILE_C] {
 /// computes a narrow tile. `a` and `b` must each hold at least `k_chunks * TILE_BYTES` bytes.
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[allow(unused_assignments)]
-unsafe fn tile_dot_ime(a: *const i8, b: *const i8, k_chunks: usize, c: *mut i32) {
+pub(crate) unsafe fn tile_dot_ime(a: *const i8, b: *const i8, k_chunks: usize, c: *mut i32) {
+    if k_chunks == 0 {
+        // SAFETY: `c` points to 64 valid `i32` slots per caller contract.
+        unsafe {
+            core::ptr::write_bytes(c, 0, TILE_C);
+        }
+        return;
+    }
     let (mut pa, mut pb, mut n) = (a, b, k_chunks);
     // SAFETY: `pa`/`pb` read `k_chunks * 128` bytes (caller contract) and `c` receives 64 `i32`.
     // The raw `.word 0xe304302b` is `smt.vmadot v0, v8, v16, i8` (verified with llvm-mc `+xsmtvdotii`).
@@ -155,7 +361,7 @@ unsafe fn tile_dot_ime(a: *const i8, b: *const i8, k_chunks: usize, c: *mut i32)
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[inline]
-fn is_vlen_1024() -> bool {
+pub(crate) fn is_vlen_1024() -> bool {
     let vlenb: usize;
     // SAFETY: reads the read-only `vlenb` CSR.
     unsafe {
@@ -238,7 +444,7 @@ pub fn gemm_i8_ime<F>(
                     tile_dot_ime(a.as_ptr(), b.as_ptr(), k_chunks, c.as_mut_ptr());
                 }
             } else {
-                c = tile_dot_scalar(a, b, k_chunks);
+                c = tile_dot_rvv(a, b, k_chunks);
             }
             #[cfg(any(not(target_arch = "riscv64"), miri))]
             let c = tile_dot_scalar(a, b, k_chunks);
@@ -771,11 +977,15 @@ pub fn bitlinear_i8_ime(
                     }
                     c_hw
                 } else {
-                    tile_dot_scalar(
+                    let mut c_rvv = [0_i32; TILE_C];
+                    tile_dot_rvv_rows(
                         &a_tile[..k_chunks * TILE_BYTES],
                         &b_tile[..k_chunks * TILE_BYTES],
                         k_chunks,
-                    )
+                        1,
+                        &mut c_rvv,
+                    );
+                    c_rvv
                 }
                 #[cfg(any(not(target_arch = "riscv64"), miri))]
                 {
@@ -902,5 +1112,35 @@ mod tests {
         assert_eq!(packed.len(), TILE_BYTES);
         assert_eq!(&packed[..32], &src[..]);
         assert!(packed[32..].iter().all(|&v| v == 0));
+
+        let aligned = pack_tiles_aligned128(&src, 2, 16);
+        assert_eq!(aligned.len(), 1);
+        assert_eq!(aligned.as_ptr() as usize % 128, 0);
+        assert_eq!(Aligned128::slice_as_i8(&aligned), packed.as_slice());
+    }
+
+    #[test]
+    fn tile_dot_rows_and_rvv_fallback_match_scalar() {
+        let lhs = fill(5 * 32, 3);
+        let rhs = fill(8 * 32, 7);
+        let ap = pack_tiles_aligned128(&lhs, 5, 32);
+        let bp = pack_tiles_aligned128(&rhs, 8, 32);
+        let a_i8 = Aligned128::slice_as_i8(&ap);
+        let b_i8 = Aligned128::slice_as_i8(&bp);
+
+        let full = tile_dot_scalar(a_i8, b_i8, 2);
+        let mut partial = [0_i32; TILE_C];
+        tile_dot_scalar_rows(a_i8, b_i8, 2, 5, &mut partial);
+        assert_eq!(&partial[..5 * TILE_N], &full[..5 * TILE_N]);
+        assert!(partial[5 * TILE_N..].iter().all(|&v| v == 0));
+
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            let rvv_full = tile_dot_rvv(a_i8, b_i8, 2);
+            assert_eq!(rvv_full, full);
+            let mut rvv_partial = [0_i32; TILE_C];
+            tile_dot_rvv_rows(a_i8, b_i8, 2, 5, &mut rvv_partial);
+            assert_eq!(rvv_partial, partial);
+        }
     }
 }

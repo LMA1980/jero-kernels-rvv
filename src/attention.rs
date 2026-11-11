@@ -23,6 +23,66 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[inline]
+#[allow(unused_assignments)]
+fn axpy_f32_rvv(out: &mut [f32], x: &[f32], alpha: f32) {
+    let len = out.len().min(x.len());
+    if len == 0 {
+        return;
+    }
+    let mut po = out.as_mut_ptr();
+    let mut px = x.as_ptr();
+    let mut rem = len;
+
+    // SAFETY: `po` and `px` are valid for `rem` f32 elements and do not alias (`out` is `&mut`).
+    // Strip-mined `e32, m4` loop computes `out[i] += alpha * x[i]` on both `zvl256b` and `zvl1024b`.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "vsetvli t0, {rem}, e32, m4, ta, ma",
+            "vle32.v v8, ({po})",
+            "vle32.v v16, ({px})",
+            "vfmacc.vf v8, {alpha}, v16",
+            "vse32.v v8, ({po})",
+            "slli t1, t0, 2",
+            "add {po}, {po}, t1",
+            "add {px}, {px}, t1",
+            "sub {rem}, {rem}, t0",
+            "bnez {rem}, 2b",
+            po = inout(reg) po,
+            px = inout(reg) px,
+            rem = inout(reg) rem,
+            alpha = in(freg) alpha,
+            out("t0") _,
+            out("t1") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            options(nostack),
+        );
+    }
+}
+
+#[inline]
+fn axpy_f32(out: &mut [f32], x: &[f32], alpha: f32) {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        axpy_f32_rvv(out, x, alpha);
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        for (dst, &val) in out.iter_mut().zip(x) {
+            *dst += alpha * val;
+        }
+    }
+}
+
 /// Computes Grouped-Query Attention (`GQA`) for a single query token across a sequence of cached keys and values.
 ///
 /// # Memory Layout
@@ -193,9 +253,7 @@ pub fn gqa_causal_attention_f32(
             }
             let kv_offset = (s * n_heads_kv + h_kv) * head_dim;
             let v_slice = &v_cache[kv_offset..kv_offset + head_dim];
-            for (d, &val) in v_slice.iter().enumerate() {
-                out_head[d] += weight * val;
-            }
+            axpy_f32(out_head, v_slice, weight);
         }
     }
 
