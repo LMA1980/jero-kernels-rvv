@@ -84,9 +84,8 @@ stages:
     name: "Build Release Binaries (cargo build --release)"
     tasks: ["build-release-task"]
     depends_on: ["clippy-check"]
-    tags: ["k3"]
+    tags: ["build"]
     threads: 6
-    toolchain: "llvm-24"
     exclusive: false
     max_concurrent_per_node: 1
 
@@ -94,9 +93,8 @@ stages:
     name: "Execute Test Suite (cargo test)"
     tasks: ["test-task"]
     depends_on: ["build-release"]
-    tags: ["k3"]
+    tags: ["test"]
     threads: 6
-    toolchain: "llvm-24"
     exclusive: true
     max_concurrent_per_node: 1
 
@@ -104,9 +102,8 @@ stages:
     name: "Evaluate Line Code Coverage (cargo llvm-cov)"
     tasks: ["coverage-task"]
     depends_on: ["test-check", "audit-check"]
-    tags: ["k3"]
+    tags: ["test"]
     threads: 6
-    toolchain: "llvm-24"
     exclusive: true
     max_concurrent_per_node: 1
 
@@ -114,7 +111,7 @@ stages:
     name: "Verify Safe Execution & Undefined Behavior via Miri (cargo miri test)"
     tasks: ["miri-task"]
     depends_on: ["test-check"]
-    tags: ["k3"]
+    tags: ["test"]
     threads: 6
     exclusive: false
     max_concurrent_per_node: 1
