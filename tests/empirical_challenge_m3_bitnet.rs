@@ -736,17 +736,21 @@ fn test_challenge_m3_performance_and_throughput() {
         "[PERF] SubLN (256): {subln_per_call:.1} ns/token | ReLU^2 (256): {relu_per_call:.1} ns/token | BitLinear GEMV (256x256): {bitlinear_per_call:.1} ns/call"
     );
 
-    // Assert that latency is comfortably within real-time budgets (< 100 microseconds per call)
+    // Assert that latency is comfortably within real-time budgets (< 100 microseconds per call in release, relaxed in unoptimized debug)
+    let max_subln = if cfg!(debug_assertions) { 1_000_000.0 } else { 100_000.0 };
+    let max_relu = if cfg!(debug_assertions) { 1_000_000.0 } else { 100_000.0 };
+    let max_bitlinear = if cfg!(debug_assertions) { 10_000_000.0 } else { 1_000_000.0 };
+
     assert!(
-        subln_per_call < 100_000.0,
+        subln_per_call < max_subln,
         "SubLN latency too high: {subln_per_call} ns"
     );
     assert!(
-        relu_per_call < 100_000.0,
+        relu_per_call < max_relu,
         "ReLU^2 latency too high: {relu_per_call} ns"
     );
     assert!(
-        bitlinear_per_call < 1_000_000.0,
+        bitlinear_per_call < max_bitlinear,
         "BitLinear GEMV latency too high: {bitlinear_per_call} ns"
     );
 }
