@@ -260,6 +260,156 @@ pub fn gqa_causal_attention_f32(
     Ok(())
 }
 
+/// Computes unmasked bidirectional multi-head scaled dot-product attention over `seq_len` tokens.
+///
+/// Tensor layout for `out`, `q`, `k`, and `v` is row-major `[seq_len, n_heads, head_dim]`.
+/// When `window_size` is `Some(w)`, query position `i` attends symmetrically to keys where
+/// `|i - j| <= w`; when `None`, full global bidirectional attention over `0..seq_len` runs.
+///
+/// # Errors
+/// Returns [`K3Error::CapabilityMismatch`] if `seq_len`, `n_heads`, `head_dim`, or element counts
+/// overflow/are zero, and [`K3Error::TensorBoundsError`] if any buffer length mismatches.
+#[allow(clippy::too_many_arguments)]
+pub fn bidirectional_attention_f32(
+    out: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    window_size: Option<usize>,
+    scale: f32,
+) -> Result<(), K3Error> {
+    if seq_len == 0 || n_heads == 0 || head_dim == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "bidirectional_attention".to_owned(),
+            reason: "seq_len, n_heads, and head_dim must be non-zero".to_owned(),
+        });
+    }
+
+    let expected_len = seq_len
+        .checked_mul(n_heads)
+        .and_then(|n| n.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "bidirectional_attention".to_owned(),
+            reason: "attention buffer dimensions overflow usize".to_owned(),
+        })?;
+    let expected_bytes = expected_len.saturating_mul(size_of::<f32>());
+
+    for (name, len) in [
+        ("out", out.len()),
+        ("q", q.len()),
+        ("k", k.len()),
+        ("v", v.len()),
+    ] {
+        if len != expected_len {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: expected_bytes,
+                buffer_len: len.saturating_mul(size_of::<f32>()),
+                reason: format!("expected {expected_len} elements for {name}, got {len}"),
+            });
+        }
+    }
+
+    let mut scores = vec![0.0_f32; seq_len];
+
+    for i in 0..seq_len {
+        let (win_start, win_end) = match window_size {
+            Some(w) => (i.saturating_sub(w), i.saturating_add(w).min(seq_len - 1)),
+            None => (0, seq_len - 1),
+        };
+        let active_len = win_end - win_start + 1;
+
+        for h in 0..n_heads {
+            let q_off = (i * n_heads + h) * head_dim;
+            let q_head = &q[q_off..q_off + head_dim];
+
+            let mut max_score = f32::NEG_INFINITY;
+            for (rel_idx, j) in (win_start..=win_end).enumerate() {
+                let k_off = (j * n_heads + h) * head_dim;
+                let k_head = &k[k_off..k_off + head_dim];
+                let score = dot_f32(q_head, k_head) * scale;
+                scores[rel_idx] = score;
+                if score > max_score {
+                    max_score = score;
+                }
+            }
+
+            let mut weight_sum = 0.0_f32;
+            for score in &mut scores[..active_len] {
+                let w = (*score - max_score).exp();
+                *score = w;
+                weight_sum += w;
+            }
+            #[allow(clippy::cast_precision_loss)]
+            let inv_sum = if weight_sum > 0.0 {
+                1.0 / weight_sum
+            } else {
+                1.0 / (active_len as f32)
+            };
+
+            let out_head = &mut out[q_off..q_off + head_dim];
+            out_head.fill(0.0);
+
+            for (rel_idx, j) in (win_start..=win_end).enumerate() {
+                let weight = scores[rel_idx] * inv_sum;
+                if weight == 0.0 {
+                    continue;
+                }
+                let v_off = (j * n_heads + h) * head_dim;
+                let v_head = &v[v_off..v_off + head_dim];
+                axpy_f32(out_head, v_head, weight);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Pools a `[seq_len, hidden_dim]` sequence tensor into a `[hidden_dim]` embedding vector.
+///
+/// When `mean_pool` is `true`, computes the arithmetic mean across all `seq_len` token vectors;
+/// when `false`, extracts the first (`[CLS]`) token vector at index `0`.
+pub fn pool_sequence_f32(
+    out: &mut [f32],
+    hidden: &[f32],
+    seq_len: usize,
+    hidden_dim: usize,
+    mean_pool: bool,
+) {
+    out.fill(0.0);
+    if seq_len == 0 || hidden_dim == 0 || out.is_empty() || hidden.is_empty() {
+        return;
+    }
+
+    let dim = hidden_dim.min(out.len()).min(hidden.len());
+    let max_rows = hidden.len() / hidden_dim;
+    let active_seq = seq_len.min(max_rows);
+    if active_seq == 0 {
+        return;
+    }
+
+    let pooled = &mut out[..dim];
+    if !mean_pool {
+        pooled.copy_from_slice(&hidden[..dim]);
+        return;
+    }
+
+    for s in 0..active_seq {
+        let start = s * hidden_dim;
+        let row = &hidden[start..start + dim];
+        axpy_f32(pooled, row, 1.0);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let inv_seq = 1.0 / (active_seq as f32);
+    for val in pooled {
+        *val *= inv_seq;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +485,75 @@ mod tests {
             gqa_causal_attention_f32(&mut out, &q[..2], &k, &v, 2, 1, 2, 1, 1.0),
             Err(K3Error::TensorBoundsError { .. })
         ));
+    }
+
+    #[test]
+    fn test_bidirectional_attention_and_pooling() {
+        // seq_len=3, n_heads=1, head_dim=2:
+        // Keys/values are orthogonal one-hot directions scaled clearly:
+        // tok 0 -> [1, 0], v0 = [10, 0]
+        // tok 1 -> [0, 1], v1 = [0, 20]
+        // tok 2 -> [1, 0], v2 = [100, 0]
+        let q = [
+            0.0_f32, 10.0, // tok 0 queries tok 1 (future token!) strongly
+            10.0, 0.0, // tok 1 queries tok 0 and tok 2
+            10.0, 0.0, // tok 2 queries tok 0 and tok 2
+        ];
+        let k = [
+            1.0_f32, 0.0, // tok 0
+            0.0, 1.0, // tok 1
+            1.0, 0.0, // tok 2
+        ];
+        let v = [
+            10.0_f32, 0.0, // tok 0
+            0.0, 20.0, // tok 1
+            100.0, 0.0, // tok 2
+        ];
+
+        // 1. Global unmasked bidirectional attention: tok 0 sees future tok 1 (v1[1] = 20).
+        let mut out_global = [0.0_f32; 6];
+        bidirectional_attention_f32(&mut out_global, &q, &k, &v, 3, 1, 2, None, 1.0)
+            .expect("global bidirectional attention succeeds");
+        assert!(
+            out_global[1] > 19.0,
+            "tok 0 must attend unmasked to future tok 1"
+        );
+        // tok 0 also has equal score (0.0) on tok 0 and tok 2, both within global context.
+        assert!(out_global[0] > 0.0);
+
+        // 2. Local sliding window w=0 (self-only): tok 0 only attends to tok 0 => out[0..2] == v[0..2]
+        let mut out_w0 = [0.0_f32; 6];
+        bidirectional_attention_f32(&mut out_w0, &q, &k, &v, 3, 1, 2, Some(0), 1.0)
+            .expect("window=0 attention succeeds");
+        assert!((out_w0[0] - 10.0).abs() <= 1e-5);
+        assert!(out_w0[1].abs() <= 1e-5);
+
+        // 3. Local sliding window w=1 on tok 0 excludes tok 2 (|0 - 2| > 1).
+        let mut out_w1 = [0.0_f32; 6];
+        bidirectional_attention_f32(&mut out_w1, &q, &k, &v, 3, 1, 2, Some(1), 1.0)
+            .expect("window=1 attention succeeds");
+        assert!(out_w1[0] < out_global[0]);
+
+        // 4. Error validation
+        assert!(matches!(
+            bidirectional_attention_f32(&mut out_w1, &q[..4], &k, &v, 3, 1, 2, None, 1.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            bidirectional_attention_f32(&mut out_w1, &q, &k, &v, 0, 1, 2, None, 1.0),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // 5. Sequence pooling: CLS vs MeanPool
+        let hidden = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut cls_out = [0.0_f32; 2];
+        pool_sequence_f32(&mut cls_out, &hidden, 3, 2, false);
+        assert!((cls_out[0] - 1.0).abs() <= 1e-6);
+        assert!((cls_out[1] - 2.0).abs() <= 1e-6);
+
+        let mut mean_out = [0.0_f32; 2];
+        pool_sequence_f32(&mut mean_out, &hidden, 3, 2, true);
+        assert!((mean_out[0] - 3.0).abs() <= 1e-6);
+        assert!((mean_out[1] - 4.0).abs() <= 1e-6);
     }
 }
