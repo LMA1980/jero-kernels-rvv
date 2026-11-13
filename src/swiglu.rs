@@ -69,6 +69,65 @@ pub fn swiglu_f32(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Err
     Ok(())
 }
 
+/// Computes Gemma `GeGLU` gated activation using the `tanh` GELU approximation:
+/// $out[i] = \text{GELU}_{\text{tanh}}(gate[i]) \cdot up[i]$.
+///
+/// # Numerical Stability
+///
+/// Clamps extreme gate inputs beyond $[-15.0, 15.0]$ where $\tanh$ saturates to $\pm 1.0$
+/// so $gate^3$ never overflows to `NaN` or infinity.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `out`, `gate`, and `up` lengths do not match or are empty.
+pub fn geglu_f32(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Error> {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const GELU_CUBIC_COEF: f32 = 0.044_715;
+
+    let len = gate.len();
+    if len == 0 || out.len() != len || up.len() != len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "geglu".to_owned(),
+            offset: 0,
+            byte_len: size_of_val(out),
+            buffer_len: size_of_val(gate),
+            reason: format!(
+                "dimension mismatch: gate={len}, up={}, out={}",
+                up.len(),
+                out.len()
+            ),
+        });
+    }
+
+    for i in 0..len {
+        let g = gate[i];
+        let gelu = if !g.is_finite() || g <= -15.0_f32 {
+            0.0_f32
+        } else if g >= 15.0_f32 {
+            g
+        } else {
+            let inner = SQRT_2_OVER_PI * (g + GELU_CUBIC_COEF * g * g * g);
+            0.5_f32 * g * (1.0_f32 + inner.tanh())
+        };
+        out[i] = gelu * up[i];
+    }
+
+    Ok(())
+}
+
+/// Applies Gemma 2 logit softcapping in-place: `x = cap * tanh(x / cap)`.
+///
+/// Values are skipped (no-op) when `cap <= 0.0` or `!cap.is_finite()`.
+pub fn logit_softcap_tanh_inplace(logits: &mut [f32], cap: f32) {
+    if !cap.is_finite() || cap <= 0.0_f32 {
+        return;
+    }
+    let inv_cap = 1.0_f32 / cap;
+    for logit in logits.iter_mut() {
+        *logit = cap * (*logit * inv_cap).tanh();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +190,36 @@ mod tests {
             swiglu_f32(&mut out, &gate, &up),
             Err(K3Error::TensorBoundsError { .. })
         ));
+    }
+
+    #[test]
+    fn test_geglu_and_logit_softcap() {
+        let gate = [0.0_f32, 1.0, -100.0, 100.0];
+        let up = [4.0_f32, 2.0, 3.0, 0.5];
+        let mut out = [0.0_f32; 4];
+        geglu_f32(&mut out, &gate, &up).expect("geglu_f32 succeeds");
+
+        assert_eq!(out[0], 0.0);
+        let expected_gelu_one = f32::midpoint(
+            1.0_f32,
+            (0.797_884_6_f32 * (1.0_f32 + 0.044_715_f32)).tanh(),
+        );
+        assert!((out[1] - expected_gelu_one * 2.0).abs() < 1e-5);
+        assert_eq!(out[2], 0.0);
+        assert!((out[3] - 50.0).abs() < 1e-4);
+        assert!(out.iter().all(|v| v.is_finite()));
+
+        let mut logits = [-200.0_f32, -30.0, 0.0, 30.0, 200.0];
+        logit_softcap_tanh_inplace(&mut logits, 30.0);
+        assert!((logits[2] - 0.0).abs() < 1e-6);
+        assert!((logits[3] - 30.0 * 1.0_f32.tanh()).abs() < 1e-5);
+        assert!((logits[1] - (-30.0 * 1.0_f32.tanh())).abs() < 1e-5);
+        assert!(logits[0] > -30.0001 && logits[0] <= -29.99);
+        assert!(logits[4] < 30.0001 && logits[4] >= 29.99);
+
+        // Non-positive cap is a safe no-op.
+        let before = logits;
+        logit_softcap_tanh_inplace(&mut logits, 0.0);
+        assert_eq!(logits, before);
     }
 }

@@ -24,9 +24,11 @@ pub use ime::{
     bitlinear_i8_ime, bitlinear_i8_rvv, pack_tiles_aligned128, unpack_tq1_0_block_i8,
     unpack_tq2_0_block_i8,
 };
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use norm::rmsnorm_unit_offset_rvv;
 pub use norm::{
     l2_norm_f32, l2_norm_f32_in_place, l2_norm_f32_in_place_scalar, l2_norm_f32_scalar,
-    l2_norm_inplace_f32,
+    l2_norm_inplace_f32, qk_norm_inplace, rmsnorm_unit_offset, rmsnorm_unit_offset_scalar,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::{l2_norm_f32_in_place_rvv, l2_norm_f32_rvv};
@@ -34,10 +36,10 @@ pub use quant::{
     Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
     Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, dequantize_q4_0_block,
     dequantize_q5_k_block, dequantize_q5_k_block_struct, dequantize_q6_k_block,
-    dequantize_q8_0_block, matvec_q5_k, matvec_q5_k_slice, validate_q5_k_dimensions, vec_dot_bf16,
-    vec_dot_bf16_scalar, vec_dot_f16, vec_dot_f16_scalar, vec_dot_q4_0, vec_dot_q4_0_scalar,
-    vec_dot_q5_k, vec_dot_q5_k_scalar, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0,
-    vec_dot_q8_0_scalar,
+    dequantize_q8_0_block, dequantize_token_row, matvec_q5_k, matvec_q5_k_slice,
+    validate_q5_k_dimensions, vec_dot_bf16, vec_dot_bf16_scalar, vec_dot_f16, vec_dot_f16_scalar,
+    vec_dot_q4_0, vec_dot_q4_0_scalar, vec_dot_q5_k, vec_dot_q5_k_scalar, vec_dot_q6_k,
+    vec_dot_q6_k_scalar, vec_dot_q8_0, vec_dot_q8_0_scalar,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use quant::{
@@ -64,7 +66,7 @@ pub use residual::{
 pub use rope::{
     RopeScalingConfig, apply_rope_inplace, apply_rope_with_inv_freq, precompute_rope_inv_freq,
 };
-pub use swiglu::{bf16_to_f32_finite, swiglu_f32};
+pub use swiglu::{bf16_to_f32_finite, geglu_f32, logit_softcap_tanh_inplace, swiglu_f32};
 
 /// Number of scalar elements per `Q4_K_M` super-block.
 pub const Q4_K_M_BLOCK_ELEMENTS: usize = 256;
