@@ -1358,6 +1358,257 @@ pub fn vec_dot_bf16(
     }
 }
 
+fn validate_token_row_geometry(
+    table: &TensorView<'_>,
+    row_idx: usize,
+    cols: usize,
+) -> Result<usize, K3Error> {
+    let raw = table.as_bytes();
+    if cols == 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: table.name().to_owned(),
+            offset: table.offset(),
+            byte_len: table.byte_len(),
+            buffer_len: raw.len(),
+            reason: "dequantize_token_row output slice cannot be empty".to_owned(),
+        });
+    }
+
+    let total_elems = table.num_elements();
+    if total_elems == 0 || total_elems % cols != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: table.name().to_owned(),
+            offset: table.offset(),
+            byte_len: table.byte_len(),
+            buffer_len: raw.len(),
+            reason: format!(
+                "tensor element count {total_elems} is not a positive multiple of row width {cols}"
+            ),
+        });
+    }
+
+    let num_rows = total_elems / cols;
+    let shape = table.shape();
+    if shape.len() == 2 {
+        let matches_orientation = (shape[0] == cols && shape[1] == num_rows)
+            || (shape[1] == cols && shape[0] == num_rows);
+        if !matches_orientation {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: table.name().to_owned(),
+                offset: table.offset(),
+                byte_len: table.byte_len(),
+                buffer_len: raw.len(),
+                reason: format!(
+                    "tensor shape [{}, {}] does not match row width {cols} and row count {num_rows}",
+                    shape[0], shape[1]
+                ),
+            });
+        }
+    }
+
+    if row_idx >= num_rows {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: table.name().to_owned(),
+            offset: row_idx,
+            byte_len: table.byte_len(),
+            buffer_len: raw.len(),
+            reason: format!("row index {row_idx} out of bounds for {num_rows} rows"),
+        });
+    }
+
+    Ok(num_rows)
+}
+
+fn dequantize_block_row<const BLOCK_ELEMS: usize, const BLOCK_BYTES: usize>(
+    table: &TensorView<'_>,
+    row_idx: usize,
+    out: &mut [f32],
+    decode_block: fn(&[u8; BLOCK_BYTES], &mut [f32; BLOCK_ELEMS]),
+) -> Result<(), K3Error> {
+    let cols = out.len();
+    let raw = table.as_bytes();
+    if cols % BLOCK_ELEMS != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: table.name().to_owned(),
+            offset: table.offset(),
+            byte_len: table.byte_len(),
+            buffer_len: raw.len(),
+            reason: format!(
+                "row width {cols} is not aligned to {:?} block size {BLOCK_ELEMS}",
+                table.quant()
+            ),
+        });
+    }
+
+    let blocks_per_row = cols / BLOCK_ELEMS;
+    let row_bytes =
+        blocks_per_row
+            .checked_mul(BLOCK_BYTES)
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: table.name().to_owned(),
+                offset: table.offset(),
+                byte_len: table.byte_len(),
+                buffer_len: raw.len(),
+                reason: "row byte stride overflowed usize".to_owned(),
+            })?;
+    let row_start = row_idx
+        .checked_mul(row_bytes)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: table.name().to_owned(),
+            offset: table.offset(),
+            byte_len: table.byte_len(),
+            buffer_len: raw.len(),
+            reason: "row byte offset overflowed usize".to_owned(),
+        })?;
+    let row_end = row_start
+        .checked_add(row_bytes)
+        .filter(|&end| end <= raw.len())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: table.name().to_owned(),
+            offset: row_start,
+            byte_len: row_bytes,
+            buffer_len: raw.len(),
+            reason: format!(
+                "row {row_idx} byte range [{row_start}..{}] exceeds tensor buffer len {}",
+                row_start.saturating_add(row_bytes),
+                raw.len()
+            ),
+        })?;
+
+    let row_slice = &raw[row_start..row_end];
+    let mut block_out = [0.0_f32; BLOCK_ELEMS];
+    for (blk_idx, out_chunk) in out.chunks_exact_mut(BLOCK_ELEMS).enumerate() {
+        let start = blk_idx * BLOCK_BYTES;
+        let end = start + BLOCK_BYTES;
+        let block: &[u8; BLOCK_BYTES] =
+            row_slice[start..end]
+                .try_into()
+                .map_err(|_| K3Error::TensorBoundsError {
+                    tensor_name: table.name().to_owned(),
+                    offset: row_start + start,
+                    byte_len: BLOCK_BYTES,
+                    buffer_len: raw.len(),
+                    reason: "failed to slice quantized token block".to_owned(),
+                })?;
+        decode_block(block, &mut block_out);
+        out_chunk.copy_from_slice(&block_out);
+    }
+
+    Ok(())
+}
+
+/// Zero-copy single-row dequantization directly from a memory-mapped embedding table [`TensorView`].
+///
+/// Decodes only the blocks corresponding to `row_idx` without materializing the full vocabulary table.
+/// Supports `Q4_0`, `Q8_0`, `Q4_K_M`, `Q5_K`, `Q6_K`, `F32`, `F16`, and `BF16`.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::TensorBoundsError`] if `out` is empty, `row_idx` exceeds row count, or
+///   block alignment/buffer bounds fail.
+/// - Returns [`K3Error::CapabilityMismatch`] if `table.quant()` is not supported for row lookup.
+pub fn dequantize_token_row(
+    table: &TensorView<'_>,
+    row_idx: usize,
+    out: &mut [f32],
+) -> Result<(), K3Error> {
+    let cols = out.len();
+    let _num_rows = validate_token_row_geometry(table, row_idx, cols)?;
+    let raw = table.as_bytes();
+
+    match table.quant() {
+        QuantType::Q4_0 => dequantize_block_row::<Q4_0_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES>(
+            table,
+            row_idx,
+            out,
+            dequantize_q4_0_block,
+        ),
+        QuantType::Q8_0 => dequantize_block_row::<Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES>(
+            table,
+            row_idx,
+            out,
+            dequantize_q8_0_block,
+        ),
+        QuantType::Q4_K_M => dequantize_block_row::<
+            { crate::Q4_K_M_BLOCK_ELEMENTS },
+            { crate::Q4_K_M_BLOCK_BYTES },
+        >(table, row_idx, out, crate::dequantize_q4_k_m_block),
+        QuantType::Q5_K => dequantize_block_row::<Q5_K_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES>(
+            table,
+            row_idx,
+            out,
+            dequantize_q5_k_block,
+        ),
+        QuantType::Q6_K => dequantize_block_row::<Q6_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES>(
+            table,
+            row_idx,
+            out,
+            dequantize_q6_k_block,
+        ),
+        QuantType::F32 => {
+            let row_bytes = cols
+                .checked_mul(4)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: table.name().to_owned(),
+                    offset: table.offset(),
+                    byte_len: table.byte_len(),
+                    buffer_len: raw.len(),
+                    reason: "F32 row stride overflowed usize".to_owned(),
+                })?;
+            let row_start = row_idx.saturating_mul(row_bytes);
+            let row_end = row_start.saturating_add(row_bytes);
+            if row_end > raw.len() {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: table.name().to_owned(),
+                    offset: row_start,
+                    byte_len: row_bytes,
+                    buffer_len: raw.len(),
+                    reason: "F32 row exceeds tensor buffer".to_owned(),
+                });
+            }
+            for (slot, chunk) in out.iter_mut().zip(raw[row_start..row_end].chunks_exact(4)) {
+                *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            Ok(())
+        }
+        QuantType::F16 | QuantType::BF16 => {
+            let row_bytes = cols
+                .checked_mul(2)
+                .ok_or_else(|| K3Error::TensorBoundsError {
+                    tensor_name: table.name().to_owned(),
+                    offset: table.offset(),
+                    byte_len: table.byte_len(),
+                    buffer_len: raw.len(),
+                    reason: "half-precision row stride overflowed usize".to_owned(),
+                })?;
+            let row_start = row_idx.saturating_mul(row_bytes);
+            let row_end = row_start.saturating_add(row_bytes);
+            if row_end > raw.len() {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: table.name().to_owned(),
+                    offset: row_start,
+                    byte_len: row_bytes,
+                    buffer_len: raw.len(),
+                    reason: "half-precision row exceeds tensor buffer".to_owned(),
+                });
+            }
+            let decode_half = if table.quant() == QuantType::F16 {
+                f16_to_f32_finite
+            } else {
+                bf16_to_f32_finite
+            };
+            for (slot, chunk) in out.iter_mut().zip(raw[row_start..row_end].chunks_exact(2)) {
+                *slot = decode_half(u16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            Ok(())
+        }
+        other => Err(K3Error::CapabilityMismatch {
+            architecture: "gemma".to_owned(),
+            reason: format!("dequantize_token_row does not support quant type {other:?}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1553,5 +1804,55 @@ mod tests {
         assert!((half_out[1] - (-19.0)).abs() < 1e-4);
         assert!((bfloat_out[0] - 9.5).abs() < 1e-4);
         assert!((bfloat_out[1] - (-19.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_dequantize_token_row_q4_0_q8_0() {
+        // 1. Multi-row Q4_0 table (3 rows x 32 cols)
+        let mut q4_bytes = vec![0_u8; 3 * Q4_0_BLOCK_BYTES];
+        // Row 0: d = 0.5 (0x3800), low nibbles = 9 (+1), high nibbles = 7 (-1)
+        q4_bytes[0..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        q4_bytes[2..18].fill((0x07 << 4) | 0x09);
+        // Row 2: d = 1.0 (0x3C00), low nibbles = 10 (+2), high nibbles = 6 (-2)
+        let r2 = 2 * Q4_0_BLOCK_BYTES;
+        q4_bytes[r2..r2 + 2].copy_from_slice(&0x3C00_u16.to_le_bytes());
+        q4_bytes[r2 + 2..r2 + 18].fill((0x06 << 4) | 0x0A);
+
+        let q4_view = TensorView::from_bytes(
+            "per_layer_token_embd.weight",
+            QuantType::Q4_0,
+            &[32, 3],
+            0,
+            &q4_bytes,
+        )
+        .expect("Q4_0 embedding view");
+        let mut row0 = [0.0_f32; 32];
+        let mut row2 = [0.0_f32; 32];
+        dequantize_token_row(&q4_view, 0, &mut row0).expect("dequantize Q4_0 row 0");
+        dequantize_token_row(&q4_view, 2, &mut row2).expect("dequantize Q4_0 row 2");
+        assert!(row0[..16].iter().all(|&v| (v - 0.5).abs() < 1e-6));
+        assert!(row0[16..].iter().all(|&v| (v - (-0.5)).abs() < 1e-6));
+        assert!(row2[..16].iter().all(|&v| (v - 2.0).abs() < 1e-6));
+        assert!(row2[16..].iter().all(|&v| (v - (-2.0)).abs() < 1e-6));
+
+        // 2. Multi-row Q8_0 table (2 rows x 32 cols)
+        let mut q8_bytes = vec![0_u8; 2 * Q8_0_BLOCK_BYTES];
+        q8_bytes[Q8_0_BLOCK_BYTES..Q8_0_BLOCK_BYTES + 2].copy_from_slice(&0x4000_u16.to_le_bytes()); // d = 2.0
+        for col in 0..32_u8 {
+            q8_bytes[Q8_0_BLOCK_BYTES + 2 + usize::from(col)] = col + 1;
+        }
+        let q8_view =
+            TensorView::from_bytes("token_embd.weight", QuantType::Q8_0, &[32, 2], 0, &q8_bytes)
+                .expect("Q8_0 embedding view");
+        let mut q8_row1 = [0.0_f32; 32];
+        dequantize_token_row(&q8_view, 1, &mut q8_row1).expect("dequantize Q8_0 row 1");
+        assert!((q8_row1[0] - 2.0).abs() < 1e-5);
+        assert!((q8_row1[31] - 64.0).abs() < 1e-5);
+
+        // Out-of-bounds row fails cleanly
+        assert!(matches!(
+            dequantize_token_row(&q8_view, 2, &mut q8_row1),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
     }
 }
