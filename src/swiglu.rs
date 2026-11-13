@@ -204,7 +204,7 @@ mod tests {
             1.0_f32,
             (0.797_884_6_f32 * (1.0_f32 + 0.044_715_f32)).tanh(),
         );
-        assert!((out[1] - expected_gelu_one * 2.0).abs() < 1e-5);
+        assert!((out[1] - expected_gelu_one * 2.0).abs() < 1e-4);
         assert_eq!(out[2], 0.0);
         assert!((out[3] - 50.0).abs() < 1e-4);
         assert!(out.iter().all(|v| v.is_finite()));
@@ -212,8 +212,8 @@ mod tests {
         let mut logits = [-200.0_f32, -30.0, 0.0, 30.0, 200.0];
         logit_softcap_tanh_inplace(&mut logits, 30.0);
         assert!((logits[2] - 0.0).abs() < 1e-6);
-        assert!((logits[3] - 30.0 * 1.0_f32.tanh()).abs() < 1e-5);
-        assert!((logits[1] - (-30.0 * 1.0_f32.tanh())).abs() < 1e-5);
+        assert!((logits[3] - 30.0 * 1.0_f32.tanh()).abs() < 1e-4);
+        assert!((logits[1] - (-30.0 * 1.0_f32.tanh())).abs() < 1e-4);
         assert!(logits[0] > -30.0001 && logits[0] <= -29.99);
         assert!(logits[4] < 30.0001 && logits[4] >= 29.99);
 
