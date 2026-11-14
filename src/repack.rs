@@ -2466,7 +2466,39 @@ fn execute_gemm_repacked_rows(
                         }
                     } else {
                         #[cfg(all(target_arch = "riscv64", not(miri)))]
-                        if use_hw_ime {
+                        if m <= 2 {
+                            let a_i8 = Aligned128::slice_as_i8(a_row_tiles);
+                            let b_i8 = Aligned128::slice_as_i8(b_row_tiles);
+                            let p_x_sums_base =
+                                x_sums_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
+                            let p_w_mins = w_mins_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
+                            for row_i in 0..active_m {
+                                let p_x_sums_i = if p_x_sums_base.is_null() {
+                                    core::ptr::null()
+                                } else {
+                                    // SAFETY: `x_sums` / `x_sums_16` stores `TILE_M = 8` floats
+                                    // per group.
+                                    unsafe { p_x_sums_base.add(row_i) }
+                                };
+                                // SAFETY: `a_i8.add(row_i * 16)` addresses token `row_i` inside
+                                // every `128B` `A` tile, `b_i8` holds all `scale_groups * cps`
+                                // weight chunks, and `&mut acc_f32[row_i * 8..]` has `TILE_N = 8`
+                                // writable `f32` lanes.
+                                unsafe {
+                                    fused_tile_gemv_rvv_1x8(
+                                        a_i8.as_ptr().add(row_i * 16),
+                                        b_i8.as_ptr(),
+                                        x_scales_tile.as_ptr().add(row_i),
+                                        w_scales_tile.as_ptr(),
+                                        p_x_sums_i,
+                                        p_w_mins,
+                                        *scale_groups,
+                                        *chunks_per_scale,
+                                        acc_f32[row_i * TILE_N..].as_mut_ptr(),
+                                    );
+                                }
+                            }
+                        } else if use_hw_ime {
                             let a_i8 = Aligned128::slice_as_i8(a_row_tiles);
                             let b_i8 = Aligned128::slice_as_i8(b_row_tiles);
                             let p_x_sums = x_sums_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
@@ -2788,6 +2820,206 @@ unsafe fn fused_tile_gemm_ime(
             out("v21") _,
             out("v22") _,
             out("v23") _,
+            options(nostack),
+        );
+    }
+}
+
+/// Dedicated `M = 1` (`m <= 2`) `1 x 8` fused RVV 1.0 GEMV micro-kernel (`#101`): computes
+/// `1 row x 8 output columns` directly in registers (`v24..v25`) across all `scale_groups`,
+/// avoiding the 7/8 dummy zero-row padding wasted when dispatching single-token decode to `8 x 8`
+/// `smt.vmadot`.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "raw 1x8 RVV assembly kernel keeps accumulators live in v24..v25 across scale groups"
+)]
+unsafe fn fused_tile_gemv_rvv_1x8(
+    pa: *const i8,
+    pb: *const i8,
+    pxs: *const f32,
+    pws: *const f32,
+    pxsm: *const f32,
+    pwm: *const f32,
+    scale_groups: usize,
+    chunks_per_scale: usize,
+    p_out: *mut f32,
+) {
+    if scale_groups == 0 {
+        // SAFETY: `p_out` points to `TILE_N = 8` valid `f32` elements.
+        unsafe {
+            core::ptr::write_bytes(p_out, 0, TILE_N);
+        }
+        return;
+    }
+    // SAFETY: caller guarantees `pa`/`pb` cover `scale_groups * chunks_per_scale` chunks, scale/min
+    // buffers cover `scale_groups` groups, `p_out` holds 8 `f32`s, and all instructions stay within
+    // `vl <= 16` at `e8,m1` / `e16,m2` and `vl = 4` at `e32,m1` (`VLEN >= 128`-safe).
+    unsafe {
+        core::arch::asm!(
+            "vsetivli zero, 4, e32, m1, ta, ma",
+            "vmv.v.i v24, 0",
+            "vmv.v.i v25, 0",
+            "li {xs_half}, 0",
+            "2:",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vmv.v.i v0, 0",
+            "vmv.v.i v1, 0",
+            "vmv.v.i v2, 0",
+            "vmv.v.i v3, 0",
+            "vmv.v.i v4, 0",
+            "vmv.v.i v5, 0",
+            "vmv.v.i v6, 0",
+            "vmv.v.i v7, 0",
+            "mv {ch}, {cps}",
+            "3:",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vle8.v v20, ({pa})",
+            // Weight cols 0..3
+            "addi t0, {pb}, 16",
+            "addi t1, {pb}, 32",
+            "addi t2, {pb}, 48",
+            "vle8.v v16, ({pb})",
+            "vle8.v v17, (t0)",
+            "vle8.v v18, (t1)",
+            "vle8.v v19, (t2)",
+            "vwmul.vv v22, v20, v16",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v0, v22, v0",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vwmul.vv v22, v20, v17",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v1, v22, v1",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vwmul.vv v22, v20, v18",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v2, v22, v2",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vwmul.vv v22, v20, v19",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v3, v22, v3",
+            // Weight cols 4..7
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "addi t0, {pb}, 64",
+            "addi t1, {pb}, 80",
+            "addi t2, {pb}, 96",
+            "addi t3, {pb}, 112",
+            "vle8.v v16, (t0)",
+            "vle8.v v17, (t1)",
+            "vle8.v v18, (t2)",
+            "vle8.v v19, (t3)",
+            "vwmul.vv v22, v20, v16",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v4, v22, v4",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vwmul.vv v22, v20, v17",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v5, v22, v5",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vwmul.vv v22, v20, v18",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v6, v22, v6",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vwmul.vv v22, v20, v19",
+            "vsetivli zero, 16, e16, m2, ta, ma",
+            "vwredsum.vs v7, v22, v7",
+            "addi {pa}, {pa}, 128",
+            "addi {pb}, {pb}, 128",
+            "addi {ch}, {ch}, -1",
+            "bnez {ch}, 3b",
+
+            // Scale & accumulate cols 0..3 -> v24
+            "vsetivli zero, 4, e32, m1, ta, ma",
+            "vmv.x.s t0, v3",
+            "vmv.s.x v17, t0",
+            "vmv.x.s t0, v2",
+            "vslide1up.vx v16, v17, t0",
+            "vmv.x.s t0, v1",
+            "vslide1up.vx v17, v16, t0",
+            "vmv.x.s t0, v0",
+            "vslide1up.vx v16, v17, t0",
+            "vfcvt.f.x.v v16, v16",
+            "flw ft0, 0({pxs})",
+            "vle32.v v18, ({pws})",
+            "vfmul.vf v17, v18, ft0",
+            "vfmacc.vv v24, v16, v17",
+
+            // Scale & accumulate cols 4..7 -> v25
+            "vmv.x.s t0, v7",
+            "vmv.s.x v17, t0",
+            "vmv.x.s t0, v6",
+            "vslide1up.vx v16, v17, t0",
+            "vmv.x.s t0, v5",
+            "vslide1up.vx v17, v16, t0",
+            "vmv.x.s t0, v4",
+            "vslide1up.vx v16, v17, t0",
+            "vfcvt.f.x.v v16, v16",
+            "addi t0, {pws}, 16",
+            "vle32.v v18, (t0)",
+            "vfmul.vf v17, v18, ft0",
+            "vfmacc.vv v25, v16, v17",
+            "addi {pws}, {pws}, 32",
+
+            "li t0, 1",
+            "bne {cps}, t0, 4f",
+            "xori {xs_half}, {xs_half}, 1",
+            "bnez {xs_half}, 5f",
+            "4:",
+            "addi {pxs}, {pxs}, 32",
+            "5:",
+
+            "beqz {pxsm}, 6f",
+            "flw ft0, 0({pxsm})",
+            "addi {pxsm}, {pxsm}, 32",
+            "vle32.v v18, ({pwm})",
+            "vfnmsac.vf v24, ft0, v18",
+            "addi t0, {pwm}, 16",
+            "vle32.v v18, (t0)",
+            "vfnmsac.vf v25, ft0, v18",
+            "addi {pwm}, {pwm}, 32",
+            "6:",
+            "addi {sg_rem}, {sg_rem}, -1",
+            "bnez {sg_rem}, 2b",
+
+            "vsetivli zero, 4, e32, m1, ta, ma",
+            "vse32.v v24, ({p_out})",
+            "addi t0, {p_out}, 16",
+            "vse32.v v25, (t0)",
+
+            pa = inout(reg) pa => _,
+            pb = inout(reg) pb => _,
+            pxs = inout(reg) pxs => _,
+            pws = inout(reg) pws => _,
+            pxsm = inout(reg) pxsm => _,
+            pwm = inout(reg) pwm => _,
+            sg_rem = inout(reg) scale_groups => _,
+            cps = in(reg) chunks_per_scale,
+            p_out = in(reg) p_out,
+            ch = out(reg) _,
+            xs_half = out(reg) _,
+            out("t0") _,
+            out("t1") _,
+            out("t2") _,
+            out("t3") _,
+            out("ft0") _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v22") _,
+            out("v23") _,
+            out("v24") _,
+            out("v25") _,
             options(nostack),
         );
     }

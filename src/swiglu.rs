@@ -54,7 +54,7 @@ fn validate_gated_activation_args(
 
 /// Computes the gated `SwiGLU` activation $y = \text{SiLU}(gate) \odot up = \frac{gate}{1 + e^{-gate}} \odot up$.
 ///
-/// Dispatches to [`swiglu_f32_rvv`] on `riscv64` targets and [`swiglu_f32_scalar`] elsewhere.
+/// Dispatches to `swiglu_f32_rvv` on `riscv64` targets and [`swiglu_f32_scalar`] elsewhere.
 ///
 /// # Errors
 ///
@@ -77,10 +77,10 @@ pub fn swiglu_f32(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Err
 ///
 /// # Numerical Stability
 ///
-/// For large negative gate values ($gate[i] < -20.0$), $\text{SiLU}(x) \to 0.0$, producing clean
+/// For large negative gate values (`gate[i] < -20.0`), $\text{SiLU}(x) \to 0.0$, producing clean
 /// zeroes without floating-point overflow or exponent underflow.
-/// For large positive gate values ($gate[i] > 20.0$), $\text{SiLU}(x) \approx x$, evaluating
-/// directly to $gate[i] \cdot up[i]$.
+/// For large positive gate values (`gate[i] > 20.0`), $\text{SiLU}(x) \approx x$, evaluating
+/// directly to `gate[i] * up[i]`.
 ///
 /// # Errors
 ///
@@ -235,7 +235,7 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
 }
 
 /// Computes Gemma `GeGLU` gated activation using the `tanh` GELU approximation:
-/// $out[i] = \text{GELU}_{\text{tanh}}(gate[i]) \cdot up[i]$.
+/// `out[i] = GELU_tanh(gate[i]) * up[i]`.
 ///
 /// # Numerical Stability
 ///
