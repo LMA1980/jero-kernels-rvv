@@ -290,10 +290,11 @@ fn test_challenge_bf16_exhaustive_oracle() {
 
         if exp == 0xFF {
             clamped_count += 1;
-            let expected_val = if sign == 1 { -0.0625_f32 } else { 0.0625_f32 };
+            let _ = sign;
             assert_eq!(
-                val, expected_val,
-                "BF16 non-finite 0x{bits:04X} must clamp to {expected_val}"
+                val.to_bits(),
+                0.0_f32.to_bits(),
+                "BF16 non-finite 0x{bits:04X} must clamp to 0.0"
             );
         } else {
             finite_count += 1;
@@ -330,9 +331,10 @@ fn test_challenge_f16_exhaustive_oracle() {
 
         if exp == 0x1F {
             clamped_count += 1;
-            let expected = if sign == 1 { -0.0625_f32 } else { 0.0625_f32 };
+            let expected = 0.0_f32;
             assert_eq!(
-                val, expected,
+                val.to_bits(),
+                expected.to_bits(),
                 "F16 non-finite 0x{bits:04X} must clamp to {expected}"
             );
         } else if exp == 0 {
@@ -408,11 +410,11 @@ fn test_challenge_q8_0_scale_and_quants_bounds() {
     assert_eq!(out[1], 127.0);
     assert_eq!(out[2], 0.0);
 
-    // 3. Scale NaN/Inf: Clamped to 0.0625 by f16_to_f32_finite
+    // 3. Scale NaN/Inf: Clamped to 0.0 by f16_to_f32_finite
     block[0..2].copy_from_slice(&0x7E00_u16.to_le_bytes()); // NaN
     dequantize_q8_0_block(&block, &mut out);
-    assert!((out[0] - (-128.0 * 0.0625)).abs() < 1e-5);
-    assert!((out[1] - (127.0 * 0.0625)).abs() < 1e-5);
+    assert_eq!(out[0], 0.0);
+    assert_eq!(out[1], 0.0);
 }
 
 #[test]

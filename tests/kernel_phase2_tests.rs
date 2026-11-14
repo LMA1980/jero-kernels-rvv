@@ -177,15 +177,15 @@ fn test_bf16_conversion_finite_clamping_comprehensive() {
     let subnormal = bf16_to_f32_finite(0x0001);
     assert!(subnormal > 0.0 && subnormal.is_finite());
 
-    // Positive and negative infinity
-    assert_eq!(bf16_to_f32_finite(0x7F80), 0.0625);
-    assert_eq!(bf16_to_f32_finite(0xFF80), -0.0625);
+    // Positive and negative infinity clamp safely to +0.0
+    assert_eq!(bf16_to_f32_finite(0x7F80).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(bf16_to_f32_finite(0xFF80).to_bits(), 0.0_f32.to_bits());
 
-    // Various NaNs (all clamped safely)
-    assert_eq!(bf16_to_f32_finite(0x7FC0), 0.0625);
-    assert_eq!(bf16_to_f32_finite(0x7FFF), 0.0625);
-    assert_eq!(bf16_to_f32_finite(0xFFC0), -0.0625);
-    assert_eq!(bf16_to_f32_finite(0xFFFF), -0.0625);
+    // Various NaNs collapse safely to +0.0 without fabricating non-zero weights
+    assert_eq!(bf16_to_f32_finite(0x7FC0).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(bf16_to_f32_finite(0x7FFF).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(bf16_to_f32_finite(0xFFC0).to_bits(), 0.0_f32.to_bits());
+    assert_eq!(bf16_to_f32_finite(0xFFFF).to_bits(), 0.0_f32.to_bits());
 
     // Assert that NO bit pattern can ever produce NaN or Inf
     for bits in [
