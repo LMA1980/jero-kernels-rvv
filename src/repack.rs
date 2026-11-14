@@ -35,8 +35,14 @@ use crate::ime::{
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::ime::{is_vlen_1024, tile_dot_ime, tile_dot_rvv_rows};
 use crate::quant::{
-    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
-    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
+    I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMENTS, IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMENTS,
+    Q2_K_BLOCK_BYTES, Q2_K_BLOCK_ELEMENTS, Q3_K_BLOCK_BYTES, Q3_K_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES,
+    Q4_0_BLOCK_ELEMENTS, Q4_1_BLOCK_BYTES, Q4_1_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES,
+    Q5_0_BLOCK_ELEMENTS, Q5_1_BLOCK_BYTES, Q5_1_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES,
+    Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES,
+    Q8_0_BLOCK_ELEMENTS, read_i2_s_trailer_scale, unpack_i2_s_block_i8, unpack_iq4_nl_block_i8,
+    unpack_q2_k_block_i8, unpack_q3_k_block_i8, unpack_q4_1_block_i8, unpack_q5_0_block_i8,
+    unpack_q5_1_block_i8,
 };
 use crate::{
     Q4_K_M_BLOCK_BYTES, Q4_K_M_BLOCK_ELEMENTS, bf16_to_f32_finite, dot_product_f32_vla_stripmined,
@@ -447,9 +453,9 @@ pub fn quantize_row_f32_to_q8_32(
 }
 
 /// Dynamically quantized `[M, K]` activation batch packed into `128-byte`-aligned `8 x 16` `i8`
-/// tiles alongside `32`-element scales, exact `f32` sums (for asymmetric `Q4_K_M` / `Q5_K` min
-/// offsets), `256`-element super-block scales, and `128-byte`-aligned sanitized `f32` rows (for
-/// lossless `F32` / `F16` / `BF16` projections).
+/// tiles alongside `32`-element scales, exact `f32` sums (`32`-element for `Q4_K_M`/`Q5_K`/`Q4_1`/`Q5_1`
+/// and `16`-element for `Q2_K` min offsets), `256`-element super-block scales, and `128-byte`-aligned
+/// sanitized `f32` rows (for lossless `F32` / `F16` / `BF16` projections).
 #[derive(Debug, Clone)]
 pub struct QuantizedActQ8 {
     m: usize,
@@ -463,6 +469,8 @@ pub struct QuantizedActQ8 {
     x_scales: Vec<f32>,
     /// Layout: `[m_tile: 0..m_tiles][b32: 0..k_blocks32][row_in_tile: 0..8]`.
     x_sums: Vec<f32>,
+    /// Layout: `[m_tile: 0..m_tiles][ch: 0..k_chunks][row_in_tile: 0..8]` (`16`-element chunk sums).
+    x_sums_16: Vec<f32>,
     /// Layout: `[row_m: 0..m][sb256: 0..k.div_ceil(256)]`.
     super_scales_256: Vec<f32>,
     /// Layout: `[row_m: 0..m][aligned_blk: 0..k_padded / 32]` (`32` `f32`s per `Aligned128`).
@@ -489,6 +497,7 @@ impl QuantizedActQ8 {
             tiles: Vec::new(),
             x_scales: Vec::new(),
             x_sums: Vec::new(),
+            x_sums_16: Vec::new(),
             super_scales_256: Vec::new(),
             f32_rows: Vec::new(),
         }
@@ -561,6 +570,8 @@ impl QuantizedActQ8 {
         self.x_scales.resize(meta_len, 0.0_f32);
         self.x_sums.clear();
         self.x_sums.resize(meta_len, 0.0_f32);
+        self.x_sums_16.clear();
+        self.x_sums_16.resize(m_tiles * k_chunks * TILE_M, 0.0_f32);
 
         self.super_scales_256.clear();
         self.super_scales_256.resize(m * sb256_per_row, 0.0_f32);
@@ -601,6 +612,8 @@ impl QuantizedActQ8 {
                 }
             }
 
+            let row_f32 =
+                Aligned128::slice_as_f32(&self.f32_rows[row * k_blocks32..(row + 1) * k_blocks32]);
             for ch in 0..k_chunks {
                 let tile_bytes = Aligned128::slice_as_i8_mut(core::slice::from_mut(
                     &mut self.tiles[mt * k_chunks + ch],
@@ -609,6 +622,8 @@ impl QuantizedActQ8 {
                 let src_off = ch * TILE_K;
                 tile_bytes[dst_off..dst_off + TILE_K]
                     .copy_from_slice(&row_q8[src_off..src_off + TILE_K]);
+                self.x_sums_16[(mt * k_chunks + ch) * TILE_M + r_in_tile] =
+                    row_f32[src_off..src_off + TILE_K].iter().copied().sum();
             }
         }
 
@@ -687,7 +702,8 @@ enum RepackedStorage {
         tiles: Vec<Aligned128>,
         /// Layout: `[n_tile: 0..n_tiles][sg: 0..scale_groups][j: 0..8]`.
         scales: Vec<f32>,
-        /// Layout: `[n_tile: 0..n_tiles][sg: 0..scale_groups][j: 0..8]` (present for `Q4_K_M`, `Q5_K`).
+        /// Layout: `[n_tile: 0..n_tiles][sg: 0..scale_groups][j: 0..8]` (present for `Q4_K_M`,
+        /// `Q5_K`, `Q4_1`, `Q5_1`, `Q2_K`).
         mins: Option<Vec<f32>>,
     },
     DenseF32 {
@@ -718,6 +734,16 @@ pub struct RepackedWeight {
 /// Canonical type alias for [`RepackedWeight`].
 pub type AlignedQuantMatrix = RepackedWeight;
 
+/// Repacks a `Q5_0` weight tensor into `8x16` `i8` `A100` `XSMTVDotII` / `X100` `RVV` tiles.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `weights.quant() != QuantType::Q5_0`, or
+/// [`K3Error::TensorBoundsError`] if dimensions or backing byte bounds do not match.
+pub fn repack_q5_0_to_ime_8x16(weights: &TensorView<'_>) -> Result<RepackedWeight, K3Error> {
+    RepackedWeight::repack_q5_0_to_ime_8x16(weights)
+}
+
 #[inline]
 fn unpack_k4_scales_mins(scales_12: &[u8]) -> ([u8; 8], [u8; 8]) {
     let mut sc = [0_u8; 8];
@@ -731,6 +757,54 @@ fn unpack_k4_scales_mins(scales_12: &[u8]) -> ([u8; 8], [u8; 8]) {
         m[j] = (scales_12[j + 4] >> 4) | ((scales_12[j] >> 6) << 4);
     }
     (sc, m)
+}
+
+fn validate_matrix_shape(
+    weights: &TensorView<'_>,
+    rows: usize,
+    cols: usize,
+) -> Result<(), K3Error> {
+    let shape = weights.shape();
+    match shape.len() {
+        1 => {
+            if rows.checked_mul(cols) != Some(shape[0]) {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: weights.name().to_owned(),
+                    offset: weights.offset(),
+                    byte_len: weights.byte_len(),
+                    buffer_len: weights.as_bytes().len(),
+                    reason: format!(
+                        "1D tensor length {} does not match rows ({rows}) * cols ({cols})",
+                        shape[0]
+                    ),
+                });
+            }
+        }
+        2 => {
+            let (d0, d1) = (shape[0], shape[1]);
+            if !(d0 == rows && d1 == cols || d0 == cols && d1 == rows) {
+                return Err(K3Error::TensorBoundsError {
+                    tensor_name: weights.name().to_owned(),
+                    offset: weights.offset(),
+                    byte_len: weights.byte_len(),
+                    buffer_len: weights.as_bytes().len(),
+                    reason: format!(
+                        "tensor shape [{d0}, {d1}] does not match requested rows={rows}, cols={cols}"
+                    ),
+                });
+            }
+        }
+        other => {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: weights.name().to_owned(),
+                offset: weights.offset(),
+                byte_len: weights.byte_len(),
+                buffer_len: weights.as_bytes().len(),
+                reason: format!("expected 1D or 2D weight tensor, got {other}D"),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validate_matrix_view(
@@ -762,48 +836,7 @@ fn validate_matrix_view(
         });
     }
 
-    let shape = weights.shape();
-    match shape.len() {
-        1 => {
-            if rows.checked_mul(cols) != Some(shape[0]) {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: weights.name().to_owned(),
-                    offset: weights.offset(),
-                    byte_len: weights.byte_len(),
-                    buffer_len: weights.as_bytes().len(),
-                    reason: format!(
-                        "1D tensor length {} does not match rows ({rows}) * cols ({cols})",
-                        shape[0]
-                    ),
-                });
-            }
-        }
-        2 => {
-            let (d0, d1) = (shape[0], shape[1]);
-            let matches_rc = d0 == rows && d1 == cols;
-            let matches_cr = d0 == cols && d1 == rows;
-            if !matches_rc && !matches_cr {
-                return Err(K3Error::TensorBoundsError {
-                    tensor_name: weights.name().to_owned(),
-                    offset: weights.offset(),
-                    byte_len: weights.byte_len(),
-                    buffer_len: weights.as_bytes().len(),
-                    reason: format!(
-                        "tensor shape [{d0}, {d1}] does not match requested rows={rows}, cols={cols}"
-                    ),
-                });
-            }
-        }
-        other => {
-            return Err(K3Error::TensorBoundsError {
-                tensor_name: weights.name().to_owned(),
-                offset: weights.offset(),
-                byte_len: weights.byte_len(),
-                buffer_len: weights.as_bytes().len(),
-                reason: format!("expected 1D or 2D weight tensor, got {other}D"),
-            });
-        }
-    }
+    validate_matrix_shape(weights, rows, cols)?;
 
     let row_bytes = (cols / block_elems)
         .checked_mul(quant.block_bytes())
@@ -814,7 +847,7 @@ fn validate_matrix_view(
             buffer_len: weights.as_bytes().len(),
             reason: "row byte stride overflow".to_owned(),
         })?;
-    let total_bytes = rows
+    let payload_bytes = rows
         .checked_mul(row_bytes)
         .ok_or_else(|| K3Error::TensorBoundsError {
             tensor_name: weights.name().to_owned(),
@@ -822,6 +855,15 @@ fn validate_matrix_view(
             byte_len: weights.byte_len(),
             buffer_len: weights.as_bytes().len(),
             reason: "matrix byte length overflow".to_owned(),
+        })?;
+    let total_bytes = payload_bytes
+        .checked_add(quant.scale_trailer_bytes())
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: weights.name().to_owned(),
+            offset: weights.offset(),
+            byte_len: weights.byte_len(),
+            buffer_len: weights.as_bytes().len(),
+            reason: "matrix byte length overflow with scale trailer".to_owned(),
         })?;
 
     if weights.as_bytes().len() < total_bytes {
@@ -840,9 +882,25 @@ fn validate_matrix_view(
     Ok(row_bytes)
 }
 
+fn write_row_i8_chunks_to_tiles(
+    tiles: &mut [Aligned128],
+    nt: usize,
+    k_chunks: usize,
+    row_in_tile: usize,
+    row_i8: &[i8],
+) {
+    for ch in 0..k_chunks {
+        let tile_i8 =
+            Aligned128::slice_as_i8_mut(core::slice::from_mut(&mut tiles[nt * k_chunks + ch]));
+        let dst_off = row_in_tile * TILE_K;
+        let src_off = ch * TILE_K;
+        tile_i8[dst_off..dst_off + TILE_K].copy_from_slice(&row_i8[src_off..src_off + TILE_K]);
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "handles exact GGML sub-block unpacking across Q8_0, Q4_0, Q4_K_M, Q5_K, Q6_K, TQ1_0, and TQ2_0"
+    reason = "handles exact GGML sub-block and trailer unpacking across all BlockScaledI8 quant formats"
 )]
 fn repack_block_scaled_i8(
     raw: &[u8],
@@ -854,9 +912,21 @@ fn repack_block_scaled_i8(
     let k_padded = cols.next_multiple_of(ACT_Q8_GROUP_ELEMENTS);
     let n_tiles = tile_count(rows);
     let k_chunks = k_padded / TILE_K;
-    let chunks_per_scale = if quant == QuantType::Q6_K { 1 } else { 2 };
+    let chunks_per_scale = if matches!(quant, QuantType::Q6_K | QuantType::Q3_K | QuantType::Q2_K) {
+        1
+    } else {
+        2
+    };
     let scale_groups = k_chunks / chunks_per_scale;
-    let has_mins = matches!(quant, QuantType::Q4_K_M | QuantType::Q5_K);
+    let has_mins = matches!(
+        quant,
+        QuantType::Q4_K_M | QuantType::Q5_K | QuantType::Q4_1 | QuantType::Q5_1 | QuantType::Q2_K
+    );
+    let i2_s_scale = if quant == QuantType::I2_S {
+        read_i2_s_trailer_scale(&raw[rows * row_bytes..])
+    } else {
+        0.0_f32
+    };
 
     let mut tiles = vec![Aligned128::zeroed(); n_tiles * k_chunks];
     let mut scales = vec![0.0_f32; n_tiles * scale_groups * TILE_N];
@@ -903,6 +973,104 @@ fn repack_block_scaled_i8(
                             }
                         }
                     }
+                }
+            }
+            QuantType::Q4_1 => {
+                let n_blks = cols / Q4_1_BLOCK_ELEMENTS;
+                let mins_vec = mins.as_mut().expect("Q4_1 allocates mins");
+                let mut blk_q = [0_i8; Q4_1_BLOCK_ELEMENTS];
+                for b in 0..n_blks {
+                    let blk: &[u8; Q4_1_BLOCK_BYTES] = row_raw
+                        [b * Q4_1_BLOCK_BYTES..(b + 1) * Q4_1_BLOCK_BYTES]
+                        .try_into()
+                        .expect("20-byte Q4_1 block");
+                    let (d, m) = unpack_q4_1_block_i8(blk, &mut blk_q);
+                    let idx = (nt * scale_groups + b) * TILE_N + j;
+                    scales[idx] = d;
+                    mins_vec[idx] = if m == 0.0 { 0.0 } else { -m };
+                    row_i8[b * 32..(b + 1) * 32].copy_from_slice(&blk_q);
+                }
+            }
+            QuantType::Q5_0 => {
+                let n_blks = cols / Q5_0_BLOCK_ELEMENTS;
+                let mut blk_q = [0_i8; Q5_0_BLOCK_ELEMENTS];
+                for b in 0..n_blks {
+                    let blk: &[u8; Q5_0_BLOCK_BYTES] = row_raw
+                        [b * Q5_0_BLOCK_BYTES..(b + 1) * Q5_0_BLOCK_BYTES]
+                        .try_into()
+                        .expect("22-byte Q5_0 block");
+                    let d = unpack_q5_0_block_i8(blk, &mut blk_q);
+                    scales[(nt * scale_groups + b) * TILE_N + j] = d;
+                    if d != 0.0 {
+                        row_i8[b * 32..(b + 1) * 32].copy_from_slice(&blk_q);
+                    }
+                }
+            }
+            QuantType::Q5_1 => {
+                let n_blks = cols / Q5_1_BLOCK_ELEMENTS;
+                let mins_vec = mins.as_mut().expect("Q5_1 allocates mins");
+                let mut blk_q = [0_i8; Q5_1_BLOCK_ELEMENTS];
+                for b in 0..n_blks {
+                    let blk: &[u8; Q5_1_BLOCK_BYTES] = row_raw
+                        [b * Q5_1_BLOCK_BYTES..(b + 1) * Q5_1_BLOCK_BYTES]
+                        .try_into()
+                        .expect("24-byte Q5_1 block");
+                    let (d, m) = unpack_q5_1_block_i8(blk, &mut blk_q);
+                    let idx = (nt * scale_groups + b) * TILE_N + j;
+                    scales[idx] = d;
+                    mins_vec[idx] = if m == 0.0 { 0.0 } else { -m };
+                    row_i8[b * 32..(b + 1) * 32].copy_from_slice(&blk_q);
+                }
+            }
+            QuantType::IQ4_NL => {
+                let n_blks = cols / IQ4_NL_BLOCK_ELEMENTS;
+                let mut blk_q = [0_i8; IQ4_NL_BLOCK_ELEMENTS];
+                for b in 0..n_blks {
+                    let blk: &[u8; IQ4_NL_BLOCK_BYTES] = row_raw
+                        [b * IQ4_NL_BLOCK_BYTES..(b + 1) * IQ4_NL_BLOCK_BYTES]
+                        .try_into()
+                        .expect("18-byte IQ4_NL block");
+                    let d = unpack_iq4_nl_block_i8(blk, &mut blk_q);
+                    scales[(nt * scale_groups + b) * TILE_N + j] = d;
+                    if d != 0.0 {
+                        row_i8[b * 32..(b + 1) * 32].copy_from_slice(&blk_q);
+                    }
+                }
+            }
+            QuantType::Q2_K => {
+                let n_sblks = cols / Q2_K_BLOCK_ELEMENTS;
+                let mins_vec = mins.as_mut().expect("Q2_K allocates mins");
+                let mut sb_q = [0_i8; Q2_K_BLOCK_ELEMENTS];
+                let mut sb_sc = [0.0_f32; 16];
+                let mut sb_mn = [0.0_f32; 16];
+                for sb in 0..n_sblks {
+                    let blk: &[u8; Q2_K_BLOCK_BYTES] = row_raw
+                        [sb * Q2_K_BLOCK_BYTES..(sb + 1) * Q2_K_BLOCK_BYTES]
+                        .try_into()
+                        .expect("84-byte Q2_K block");
+                    unpack_q2_k_block_i8(blk, &mut sb_q, &mut sb_sc, &mut sb_mn);
+                    for sub in 0..16 {
+                        let idx = (nt * scale_groups + sb * 16 + sub) * TILE_N + j;
+                        scales[idx] = sb_sc[sub];
+                        mins_vec[idx] = sb_mn[sub];
+                    }
+                    row_i8[sb * 256..(sb + 1) * 256].copy_from_slice(&sb_q);
+                }
+            }
+            QuantType::Q3_K => {
+                let n_sblks = cols / Q3_K_BLOCK_ELEMENTS;
+                let mut sb_q = [0_i8; Q3_K_BLOCK_ELEMENTS];
+                let mut sb_sc = [0.0_f32; 16];
+                for sb in 0..n_sblks {
+                    let blk: &[u8; Q3_K_BLOCK_BYTES] = row_raw
+                        [sb * Q3_K_BLOCK_BYTES..(sb + 1) * Q3_K_BLOCK_BYTES]
+                        .try_into()
+                        .expect("110-byte Q3_K block");
+                    unpack_q3_k_block_i8(blk, &mut sb_q, &mut sb_sc);
+                    for (sub, &sc) in sb_sc.iter().enumerate() {
+                        scales[(nt * scale_groups + sb * 16 + sub) * TILE_N + j] = sc;
+                    }
+                    row_i8[sb * 256..(sb + 1) * 256].copy_from_slice(&sb_q);
                 }
             }
             QuantType::Q4_K_M => {
@@ -1041,16 +1209,33 @@ fn repack_block_scaled_i8(
                     row_i8[sb * 256..(sb + 1) * 256].copy_from_slice(&trits);
                 }
             }
-            QuantType::F32 | QuantType::F16 | QuantType::BF16 => unreachable!(),
+            QuantType::I2_S => {
+                let n_blks = cols / I2_S_BLOCK_ELEMENTS;
+                let mut trits = [0_i8; I2_S_BLOCK_ELEMENTS];
+                for b in 0..n_blks {
+                    let blk: &[u8; I2_S_BLOCK_BYTES] = row_raw
+                        [b * I2_S_BLOCK_BYTES..(b + 1) * I2_S_BLOCK_BYTES]
+                        .try_into()
+                        .expect("32-byte I2_S block");
+                    unpack_i2_s_block_i8(blk, &mut trits);
+                    for sub in 0..4 {
+                        scales[(nt * scale_groups + b * 4 + sub) * TILE_N + j] = i2_s_scale;
+                    }
+                    if i2_s_scale != 0.0 {
+                        row_i8[b * 128..(b + 1) * 128].copy_from_slice(&trits);
+                    }
+                }
+            }
+            QuantType::F32
+            | QuantType::F16
+            | QuantType::BF16
+            | QuantType::Q8_1
+            | QuantType::MXFP4 => {
+                unreachable!()
+            }
         }
 
-        for ch in 0..k_chunks {
-            let tile_i8 =
-                Aligned128::slice_as_i8_mut(core::slice::from_mut(&mut tiles[nt * k_chunks + ch]));
-            let dst_off = j * TILE_K;
-            let src_off = ch * TILE_K;
-            tile_i8[dst_off..dst_off + TILE_K].copy_from_slice(&row_i8[src_off..src_off + TILE_K]);
-        }
+        write_row_i8_chunks_to_tiles(&mut tiles, nt, k_chunks, j, &row_i8);
     }
 
     RepackedWeight {
@@ -1258,12 +1443,41 @@ impl RepackedWeight {
             }
             QuantType::Q8_0
             | QuantType::Q4_0
+            | QuantType::Q4_1
+            | QuantType::Q5_0
+            | QuantType::Q5_1
+            | QuantType::Q2_K
+            | QuantType::Q3_K
             | QuantType::Q4_K_M
             | QuantType::Q5_K
             | QuantType::Q6_K
+            | QuantType::IQ4_NL
             | QuantType::TQ1_0
-            | QuantType::TQ2_0 => Ok(repack_block_scaled_i8(raw, quant, rows, cols, row_bytes)),
+            | QuantType::TQ2_0
+            | QuantType::I2_S => Ok(repack_block_scaled_i8(raw, quant, rows, cols, row_bytes)),
+            QuantType::Q8_1 | QuantType::MXFP4 => Err(K3Error::unsupported_tensor_quant(
+                "repack",
+                weights.name(),
+                quant,
+            )),
         }
+    }
+
+    /// Repacks a `Q5_0` weight tensor into `8x16` `i8` `A100` `XSMTVDotII` / `X100` `RVV` tiles.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::CapabilityMismatch`] if `weights.quant() != QuantType::Q5_0`, or
+    /// [`K3Error::TensorBoundsError`] if dimensions or backing byte bounds do not match.
+    pub fn repack_q5_0_to_ime_8x16(weights: &TensorView<'_>) -> Result<Self, K3Error> {
+        if weights.quant() != QuantType::Q5_0 {
+            return Err(K3Error::unsupported_tensor_quant(
+                "repack_q5_0_to_ime_8x16",
+                weights.name(),
+                weights.quant(),
+            ));
+        }
+        Self::repack(weights)
     }
 
     /// Number of output rows `N`.
@@ -1299,8 +1513,8 @@ impl RepackedWeight {
         self.quant
     }
 
-    /// Shared-scale group size along `K` (`16` for `Q6_K`, `32` for other block-quantized formats,
-    /// or `0` for dense `F32`/`F16`/`BF16`).
+    /// Shared-scale group size along `K` (`16` for `Q6_K`, `Q3_K`, and `Q2_K`, `32` for other
+    /// block-quantized formats, or `0` for dense `F32`/`F16`/`BF16`).
     #[must_use]
     pub const fn group_size(&self) -> usize {
         match &self.storage {
@@ -1622,6 +1836,7 @@ fn execute_gemm_repacked_rows(
             let a_tiles = act.tiles();
             let x_scales = act.x_scales();
             let x_sums = act.x_sums();
+            let x_sums_16 = &act.x_sums_16;
             let k_blocks32 = act.k_blocks32;
 
             let first_nt = row_range.start / TILE_N;
@@ -1695,7 +1910,11 @@ fn execute_gemm_repacked_rows(
                         let ws = &w_scales[(nt * *scale_groups + sg) * TILE_N..][..TILE_N];
 
                         if let Some(mins_buf) = w_mins {
-                            let xsm = &x_sums[(mt * k_blocks32 + b32) * TILE_M..][..TILE_M];
+                            let xsm = if *chunks_per_scale == 2 {
+                                &x_sums[(mt * k_blocks32 + b32) * TILE_M..][..TILE_M]
+                            } else {
+                                &x_sums_16[(mt * *k_chunks + sg) * TILE_M..][..TILE_M]
+                            };
                             let wm = &mins_buf[(nt * *scale_groups + sg) * TILE_N..][..TILE_N];
                             for i in 0..active_m {
                                 let x_sc = xs[i];
@@ -2209,6 +2428,102 @@ mod tests {
         gemm_repacked_f32(&mut out_cmp, &rep_compact, &x_bf16, 2).unwrap();
         for i in 0..12 {
             assert!((out_exp[i] - out_cmp[i]).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn wave2_quants_miri_repack_dequant_gemm_and_fail_closed() {
+        // Test asymmetric Q4_1 / Q5_1 zero-scale non-zero-min + Q2_K 16-elem min sums + Q5_0 helper
+        let mut q4_1_raw = vec![0_u8; 2 * Q4_1_BLOCK_BYTES];
+        // Row 0: d=0.5, m=-0.25, nibble=(2, 5)
+        q4_1_raw[0..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        q4_1_raw[2..4].copy_from_slice(&0xB400_u16.to_le_bytes());
+        q4_1_raw[4..20].fill(0x52);
+        // Row 1: d=0.0, m=0.5 (all elements must equal +0.5)
+        q4_1_raw[22..24].copy_from_slice(&0x3800_u16.to_le_bytes());
+        q4_1_raw[24..40].fill(0xF1);
+
+        let v_q4_1 = TensorView::from_bytes("q4_1_m", QuantType::Q4_1, &[32, 2], 0, &q4_1_raw)
+            .expect("Q4_1 view");
+        let rep_q4_1 = RepackedWeight::repack(&v_q4_1).unwrap();
+        let mut row0 = [0.0_f32; 32];
+        let mut row1 = [0.0_f32; 32];
+        rep_q4_1.dequantize_row(0, &mut row0).unwrap();
+        rep_q4_1.dequantize_row(1, &mut row1).unwrap();
+        assert!(row0[..16].iter().all(|&v| (v - 0.75).abs() < 1e-6));
+        assert!(row0[16..].iter().all(|&v| (v - 2.25).abs() < 1e-6));
+        assert!(row1.iter().all(|&v| (v - 0.5).abs() < 1e-6));
+
+        // Q5_0 repack_q5_0_to_ime_8x16 helper + Q5_0 fail-closed when wrong quant
+        let mut q5_0_raw = vec![0_u8; 2 * Q5_0_BLOCK_BYTES];
+        q5_0_raw[0..2].copy_from_slice(&0x3800_u16.to_le_bytes());
+        q5_0_raw[2..6].copy_from_slice(&0xFFFF_0000_u32.to_le_bytes());
+        q5_0_raw[6..22].fill(0x12);
+        q5_0_raw[22..24].copy_from_slice(&0x3C00_u16.to_le_bytes());
+        let v_q5_0 =
+            TensorView::from_bytes("q5_0_m", QuantType::Q5_0, &[32, 2], 0, &q5_0_raw).unwrap();
+        let rep_q5_0 = repack_q5_0_to_ime_8x16(&v_q5_0).unwrap();
+        let mut q5_rep = [0.0_f32; 32];
+        let mut q5_ten = [0.0_f32; 32];
+        rep_q5_0.dequantize_row(0, &mut q5_rep).unwrap();
+        crate::quant::dequantize_tensor_row(&v_q5_0, 0, &mut q5_ten).unwrap();
+        assert_eq!(q5_rep, q5_ten);
+        assert!(matches!(
+            repack_q5_0_to_ime_8x16(&v_q4_1),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+
+        // Q2_K 16-element sub-block GEMM verifies x_sums_16 matches oracle
+        let mut q2k_raw = vec![0_u8; 2 * Q2_K_BLOCK_BYTES];
+        for r in 0..2 {
+            let off = r * Q2_K_BLOCK_BYTES;
+            for sub in 0..16 {
+                let sc = u8::try_from((r * 3 + sub) % 7 + 1).unwrap();
+                let mn = u8::try_from((r * 5 + sub * 2) % 9 + 1).unwrap();
+                q2k_raw[off + sub] = sc | (mn << 4);
+            }
+            for q in 0..64 {
+                #[expect(clippy::cast_possible_truncation, reason = "bounded test pattern")]
+                let byte = ((r * 13 + q * 7) % 256) as u8;
+                q2k_raw[off + 16 + q] = byte;
+            }
+            q2k_raw[off + 80..off + 82].copy_from_slice(&0x3800_u16.to_le_bytes()); // d = 0.5
+            q2k_raw[off + 82..off + 84].copy_from_slice(&0x3400_u16.to_le_bytes()); // dmin = 0.25
+        }
+        let v_q2k =
+            TensorView::from_bytes("q2k_m", QuantType::Q2_K, &[256, 2], 0, &q2k_raw).unwrap();
+        let rep_q2k = RepackedWeight::repack(&v_q2k).unwrap();
+        assert_eq!(rep_q2k.group_size(), 16);
+        let x: Vec<f32> = (0..256)
+            .map(|i| {
+                #[expect(clippy::cast_precision_loss, reason = "small test index")]
+                {
+                    ((i % 29) as f32 - 14.0) * 0.125
+                }
+            })
+            .collect();
+        let act = QuantizedActQ8::quantize(&x, 1, 256).unwrap();
+        let mut out_256 = [0.0_f32; 2];
+        let mut out_1024 = [0.0_f32; 2];
+        gemm_repacked_vla_sim(&mut out_256, &rep_q2k, &act, 256).unwrap();
+        gemm_repacked_vla_sim(&mut out_1024, &rep_q2k, &act, 1024).unwrap();
+        assert_eq!(out_256, out_1024);
+
+        let mut row_buf = [0.0_f32; 256];
+        for (r, &got) in out_256.iter().enumerate() {
+            rep_q2k.dequantize_row(r, &mut row_buf).unwrap();
+            let exact: f32 = row_buf.iter().zip(&x).map(|(w, a)| w * a).sum();
+            assert!((got - exact).abs() < 0.25, "Q2_K row {r}: {got} vs {exact}");
+        }
+
+        // Q8_1 / MXFP4 fail closed
+        for &unsup in &[QuantType::Q8_1, QuantType::MXFP4] {
+            let raw = vec![0_u8; unsup.block_bytes()];
+            let view = TensorView::from_bytes("unsup", unsup, &[32, 1], 0, &raw).unwrap();
+            assert!(matches!(
+                RepackedWeight::repack(&view),
+                Err(K3Error::CapabilityMismatch { .. })
+            ));
         }
     }
 }

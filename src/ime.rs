@@ -17,7 +17,10 @@ use jero_core::{K3Error, QuantType, TensorView};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::quant::{Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS};
+use crate::quant::{
+    I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS,
+    read_i2_s_trailer_scale, unpack_i2_s_block_i8,
+};
 use crate::repack::Aligned128;
 
 /// Storage size in bytes of a single `TQ1_0` block (2B FP16 scale + 52B packed base-3 quants).
@@ -637,6 +640,7 @@ fn validate_bitlinear_dimensions(
         QuantType::TQ1_0 => (TQ1_0_BLOCK_ELEMENTS, TQ1_0_BLOCK_BYTES),
         QuantType::TQ2_0 => (TQ2_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES),
         QuantType::Q8_0 => (Q8_0_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES),
+        QuantType::I2_S => (I2_S_BLOCK_ELEMENTS, I2_S_BLOCK_BYTES),
         _ => {
             return Err(K3Error::TensorBoundsError {
                 tensor_name: weights.name().to_owned(),
@@ -644,7 +648,7 @@ fn validate_bitlinear_dimensions(
                 byte_len: weights.byte_len(),
                 buffer_len: weights.as_bytes().len(),
                 reason: format!(
-                    "unsupported quantization format for BitLinear: {quant:?}; expected TQ1_0, TQ2_0, or Q8_0"
+                    "unsupported quantization format for BitLinear: {quant:?}; expected TQ1_0, TQ2_0, Q8_0, or I2_S"
                 ),
             });
         }
@@ -668,7 +672,7 @@ fn validate_bitlinear_dimensions(
             || (output_len == dim1 && input_len == dim0 && dim0 % block_elems == 0)
         {
             let required_blocks = (output_len * input_len) / block_elems;
-            let required_bytes = required_blocks * block_bytes;
+            let required_bytes = required_blocks * block_bytes + quant.scale_trailer_bytes();
             if weights.as_bytes().len() < required_bytes {
                 return Err(K3Error::TensorBoundsError {
                     tensor_name: weights.name().to_owned(),
@@ -713,7 +717,7 @@ fn validate_bitlinear_dimensions(
     }
 
     let required_blocks = (output_len * input_len) / block_elems;
-    let required_bytes = required_blocks * block_bytes;
+    let required_bytes = required_blocks * block_bytes + quant.scale_trailer_bytes();
     if weights.as_bytes().len() < required_bytes {
         return Err(K3Error::TensorBoundsError {
             tensor_name: weights.name().to_owned(),
@@ -731,9 +735,118 @@ fn validate_bitlinear_dimensions(
     Ok((output_len, input_len, block_elems, block_bytes))
 }
 
+/// Converts two consecutive 32-byte `BitNet.cpp` `I2_S` blocks (`128` elements each) and a
+/// half-precision scale into a 66-byte `TQ2_0` block (`256` elements) for packed ternary paths.
+pub fn convert_i2_s_blocks_to_tq2_0(
+    blk0: &[u8; I2_S_BLOCK_BYTES],
+    blk1: &[u8; I2_S_BLOCK_BYTES],
+    scale_f16_bits: u16,
+    out: &mut [u8; TQ2_0_BLOCK_BYTES],
+) {
+    let mut left = [0_i8; I2_S_BLOCK_ELEMENTS];
+    let mut right = [0_i8; I2_S_BLOCK_ELEMENTS];
+    unpack_i2_s_block_i8(blk0, &mut left);
+    unpack_i2_s_block_i8(blk1, &mut right);
+
+    out[0..2].copy_from_slice(&scale_f16_bits.to_le_bytes());
+    for (i, chunk) in left
+        .chunks_exact(4)
+        .chain(right.chunks_exact(4))
+        .enumerate()
+    {
+        let q0 = (chunk[0] + 1).to_ne_bytes()[0] & 0x03;
+        let q1 = (chunk[1] + 1).to_ne_bytes()[0] & 0x03;
+        let q2 = (chunk[2] + 1).to_ne_bytes()[0] & 0x03;
+        let q3 = (chunk[3] + 1).to_ne_bytes()[0] & 0x03;
+        out[2 + i] = q0 | (q1 << 2) | (q2 << 4) | (q3 << 6);
+    }
+}
+
+fn unpack_bitlinear_block_i8<'a>(
+    quant: QuantType,
+    block_raw: &[u8],
+    weights: &TensorView<'_>,
+    byte_start: usize,
+    raw_len: usize,
+    i2_s_scale: f32,
+    w_buf: &'a mut [i8; 256],
+) -> Result<(&'a [i8], f32), K3Error> {
+    match quant {
+        QuantType::TQ1_0 => {
+            let block: &[u8; 54] =
+                block_raw
+                    .try_into()
+                    .map_err(|_| K3Error::TensorBoundsError {
+                        tensor_name: weights.name().to_owned(),
+                        offset: weights.offset() + byte_start,
+                        byte_len: TQ1_0_BLOCK_BYTES,
+                        buffer_len: raw_len,
+                        reason: "invalid TQ1_0 block slice".to_owned(),
+                    })?;
+            let scale = unpack_tq1_0_block_i8(block, w_buf);
+            Ok((&w_buf[..256], scale))
+        }
+        QuantType::TQ2_0 => {
+            let block: &[u8; 66] =
+                block_raw
+                    .try_into()
+                    .map_err(|_| K3Error::TensorBoundsError {
+                        tensor_name: weights.name().to_owned(),
+                        offset: weights.offset() + byte_start,
+                        byte_len: TQ2_0_BLOCK_BYTES,
+                        buffer_len: raw_len,
+                        reason: "invalid TQ2_0 block slice".to_owned(),
+                    })?;
+            let scale = unpack_tq2_0_block_i8(block, w_buf);
+            Ok((&w_buf[..256], scale))
+        }
+        QuantType::Q8_0 => {
+            let block: &[u8; 34] =
+                block_raw
+                    .try_into()
+                    .map_err(|_| K3Error::TensorBoundsError {
+                        tensor_name: weights.name().to_owned(),
+                        offset: weights.offset() + byte_start,
+                        byte_len: Q8_0_BLOCK_BYTES,
+                        buffer_len: raw_len,
+                        reason: "invalid Q8_0 block slice".to_owned(),
+                    })?;
+            let d_bits = u16::from_le_bytes([block[0], block[1]]);
+            let scale = crate::f16_to_f32_finite(d_bits);
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "reinterpreting u8 quant as signed i8"
+            )]
+            for i in 0..32 {
+                w_buf[i] = block[2 + i] as i8;
+            }
+            Ok((&w_buf[..32], scale))
+        }
+        QuantType::I2_S => {
+            let block: &[u8; I2_S_BLOCK_BYTES] =
+                block_raw
+                    .try_into()
+                    .map_err(|_| K3Error::TensorBoundsError {
+                        tensor_name: weights.name().to_owned(),
+                        offset: weights.offset() + byte_start,
+                        byte_len: I2_S_BLOCK_BYTES,
+                        buffer_len: raw_len,
+                        reason: "invalid I2_S block slice".to_owned(),
+                    })?;
+            let dst: &mut [i8; I2_S_BLOCK_ELEMENTS] = (&mut w_buf[..I2_S_BLOCK_ELEMENTS])
+                .try_into()
+                .expect("128-element I2_S slice");
+            unpack_i2_s_block_i8(block, dst);
+            Ok((&w_buf[..I2_S_BLOCK_ELEMENTS], i2_s_scale))
+        }
+        _ => unreachable!(),
+    }
+}
+
 /// Computes matrix-vector multiplication for `BitLinear` layers using standard RVV integer vector instructions.
 ///
-/// Supports `QuantType::TQ1_0`, `QuantType::TQ2_0`, and `QuantType::Q8_0` weights with on-the-fly unpacking.
+/// Supports `QuantType::TQ1_0`, `QuantType::TQ2_0`, `QuantType::Q8_0`, and `QuantType::I2_S` weights
+/// with on-the-fly unpacking.
 /// Intermediate dot-product accumulation in `i32` is bit-identical to [`bitlinear_i8_ime`].
 ///
 /// # Errors
@@ -750,6 +863,11 @@ pub fn bitlinear_i8_rvv(
     let blocks_per_row = cols / block_elems;
     let raw_bytes = weights.as_bytes();
     let quant = weights.quant();
+    let i2_s_scale = if quant == QuantType::I2_S {
+        read_i2_s_trailer_scale(&raw_bytes[rows * blocks_per_row * block_bytes..])
+    } else {
+        0.0_f32
+    };
 
     let mut w_buf = [0_i8; 256];
     let mut dot_calls = 0_u64;
@@ -762,59 +880,15 @@ pub fn bitlinear_i8_rvv(
             let byte_end = byte_start + block_bytes;
             let block_raw = &raw_bytes[byte_start..byte_end];
 
-            let (w_slice, block_scale): (&[i8], f32) = match quant {
-                QuantType::TQ1_0 => {
-                    let block: &[u8; 54] =
-                        block_raw
-                            .try_into()
-                            .map_err(|_| K3Error::TensorBoundsError {
-                                tensor_name: weights.name().to_owned(),
-                                offset: weights.offset() + byte_start,
-                                byte_len: block_bytes,
-                                buffer_len: raw_bytes.len(),
-                                reason: "invalid TQ1_0 block slice".to_owned(),
-                            })?;
-                    let scale = unpack_tq1_0_block_i8(block, &mut w_buf);
-                    (&w_buf[..256], scale)
-                }
-                QuantType::TQ2_0 => {
-                    let block: &[u8; 66] =
-                        block_raw
-                            .try_into()
-                            .map_err(|_| K3Error::TensorBoundsError {
-                                tensor_name: weights.name().to_owned(),
-                                offset: weights.offset() + byte_start,
-                                byte_len: block_bytes,
-                                buffer_len: raw_bytes.len(),
-                                reason: "invalid TQ2_0 block slice".to_owned(),
-                            })?;
-                    let scale = unpack_tq2_0_block_i8(block, &mut w_buf);
-                    (&w_buf[..256], scale)
-                }
-                QuantType::Q8_0 => {
-                    let block: &[u8; 34] =
-                        block_raw
-                            .try_into()
-                            .map_err(|_| K3Error::TensorBoundsError {
-                                tensor_name: weights.name().to_owned(),
-                                offset: weights.offset() + byte_start,
-                                byte_len: block_bytes,
-                                buffer_len: raw_bytes.len(),
-                                reason: "invalid Q8_0 block slice".to_owned(),
-                            })?;
-                    let d_bits = u16::from_le_bytes([block[0], block[1]]);
-                    let scale = crate::f16_to_f32_finite(d_bits);
-                    #[expect(
-                        clippy::cast_possible_wrap,
-                        reason = "reinterpreting u8 quant as signed i8"
-                    )]
-                    for i in 0..32 {
-                        w_buf[i] = block[2 + i] as i8;
-                    }
-                    (&w_buf[..32], scale)
-                }
-                _ => unreachable!(),
-            };
+            let (w_slice, block_scale) = unpack_bitlinear_block_i8(
+                quant,
+                block_raw,
+                weights,
+                byte_start,
+                raw_bytes.len(),
+                i2_s_scale,
+                &mut w_buf,
+            )?;
 
             let act_sub = &act_i8[blk * block_elems..(blk + 1) * block_elems];
             let dot_i32 = dot_i8_vector(w_slice, act_sub);
@@ -836,18 +910,71 @@ pub fn bitlinear_i8_rvv(
     Ok(())
 }
 
+struct BitLinearPackCtx<'a> {
+    weights: &'a TensorView<'a>,
+    raw_bytes: &'a [u8],
+    blocks_per_row: usize,
+    block_bytes: usize,
+    k_chunks: usize,
+    i2_s_scale: f32,
+}
+
+fn pack_bitlinear_a_tile(act_sub: &[i8], k_chunks: usize, a_tile: &mut [i8; 16 * TILE_BYTES]) {
+    for ch in 0..k_chunks {
+        let act_chunk = &act_sub[ch * TILE_K..(ch + 1) * TILE_K];
+        let ch_base = ch * TILE_BYTES;
+        for i in 0..TILE_M {
+            a_tile[ch_base + i * TILE_K..ch_base + (i + 1) * TILE_K].copy_from_slice(act_chunk);
+        }
+    }
+}
+
+fn pack_bitlinear_b_tile(
+    ctx: &BitLinearPackCtx<'_>,
+    r_base: usize,
+    blk: usize,
+    tile_rows: usize,
+    b_tile: &mut [i8; 16 * TILE_BYTES],
+    scales: &mut [f32; TILE_N],
+    w_buf: &mut [i8; 256],
+) -> Result<(), K3Error> {
+    let quant = ctx.weights.quant();
+    b_tile[..ctx.k_chunks * TILE_BYTES].fill(0);
+    for (j, scale_slot) in scales.iter_mut().enumerate().take(tile_rows) {
+        let r = r_base + j;
+        let blk_idx = r * ctx.blocks_per_row + blk;
+        let byte_start = blk_idx * ctx.block_bytes;
+        let block_raw = &ctx.raw_bytes[byte_start..byte_start + ctx.block_bytes];
+
+        let (w_slice, scale) = unpack_bitlinear_block_i8(
+            quant,
+            block_raw,
+            ctx.weights,
+            byte_start,
+            ctx.raw_bytes.len(),
+            ctx.i2_s_scale,
+            w_buf,
+        )?;
+
+        *scale_slot = scale;
+        for ch in 0..ctx.k_chunks {
+            let w_chunk = &w_slice[ch * TILE_K..(ch + 1) * TILE_K];
+            let ch_base = ch * TILE_BYTES;
+            b_tile[ch_base + j * TILE_K..ch_base + (j + 1) * TILE_K].copy_from_slice(w_chunk);
+        }
+    }
+    Ok(())
+}
+
 /// Computes matrix-vector multiplication for `BitLinear` layers using A100 IME (`smt.vmadot`) acceleration.
 ///
-/// Supports `QuantType::TQ1_0`, `QuantType::TQ2_0`, and `QuantType::Q8_0` weights with on-the-fly unpacking.
+/// Supports `QuantType::TQ1_0`, `QuantType::TQ2_0`, `QuantType::Q8_0`, and `QuantType::I2_S` weights
+/// with on-the-fly unpacking.
 /// Intermediate dot-product accumulation in `i32` is bit-identical to [`bitlinear_i8_rvv`].
 ///
 /// # Errors
 ///
 /// Returns [`K3Error::TensorBoundsError`] if quantization is unsupported or dimensions mismatch.
-#[expect(
-    clippy::too_many_lines,
-    reason = "matrix-vector tiling loop with on-the-fly unpack and IME dispatch"
-)]
 pub fn bitlinear_i8_ime(
     out: &mut [f32],
     weights: &TensorView<'_>,
@@ -859,7 +986,20 @@ pub fn bitlinear_i8_ime(
     let blocks_per_row = cols / block_elems;
     let raw_bytes = weights.as_bytes();
     let quant = weights.quant();
-    let k_chunks = block_elems / TILE_K; // 16 for TQ1/TQ2, 2 for Q8_0
+    let i2_s_scale = if quant == QuantType::I2_S {
+        read_i2_s_trailer_scale(&raw_bytes[rows * blocks_per_row * block_bytes..])
+    } else {
+        0.0_f32
+    };
+    let k_chunks = block_elems / TILE_K; // 16 for TQ1/TQ2, 8 for I2_S, 2 for Q8_0
+    let pack_ctx = BitLinearPackCtx {
+        weights,
+        raw_bytes,
+        blocks_per_row,
+        block_bytes,
+        k_chunks,
+        i2_s_scale,
+    };
 
     out.fill(0.0);
 
@@ -877,88 +1017,16 @@ pub fn bitlinear_i8_ime(
 
         for blk in 0..blocks_per_row {
             let act_sub = &act_i8[blk * block_elems..(blk + 1) * block_elems];
-
-            // 1. Pack Tile A: broadcast act_sub to all TILE_M=8 rows
-            for ch in 0..k_chunks {
-                let act_chunk = &act_sub[ch * TILE_K..(ch + 1) * TILE_K];
-                let ch_base = ch * TILE_BYTES;
-                for i in 0..TILE_M {
-                    a_tile[ch_base + i * TILE_K..ch_base + (i + 1) * TILE_K]
-                        .copy_from_slice(act_chunk);
-                }
-            }
-
-            // 2. Pack Tile B: unpack up to 8 output rows
-            b_tile[..k_chunks * TILE_BYTES].fill(0);
-            for j in 0..tile_rows {
-                let r = r_base + j;
-                let blk_idx = r * blocks_per_row + blk;
-                let byte_start = blk_idx * block_bytes;
-                let byte_end = byte_start + block_bytes;
-                let block_raw = &raw_bytes[byte_start..byte_end];
-
-                let (w_slice, scale): (&[i8], f32) = match quant {
-                    QuantType::TQ1_0 => {
-                        let block: &[u8; 54] =
-                            block_raw
-                                .try_into()
-                                .map_err(|_| K3Error::TensorBoundsError {
-                                    tensor_name: weights.name().to_owned(),
-                                    offset: weights.offset() + byte_start,
-                                    byte_len: block_bytes,
-                                    buffer_len: raw_bytes.len(),
-                                    reason: "invalid TQ1_0 block slice".to_owned(),
-                                })?;
-                        let s = unpack_tq1_0_block_i8(block, &mut w_buf);
-                        (&w_buf[..256], s)
-                    }
-                    QuantType::TQ2_0 => {
-                        let block: &[u8; 66] =
-                            block_raw
-                                .try_into()
-                                .map_err(|_| K3Error::TensorBoundsError {
-                                    tensor_name: weights.name().to_owned(),
-                                    offset: weights.offset() + byte_start,
-                                    byte_len: block_bytes,
-                                    buffer_len: raw_bytes.len(),
-                                    reason: "invalid TQ2_0 block slice".to_owned(),
-                                })?;
-                        let s = unpack_tq2_0_block_i8(block, &mut w_buf);
-                        (&w_buf[..256], s)
-                    }
-                    QuantType::Q8_0 => {
-                        let block: &[u8; 34] =
-                            block_raw
-                                .try_into()
-                                .map_err(|_| K3Error::TensorBoundsError {
-                                    tensor_name: weights.name().to_owned(),
-                                    offset: weights.offset() + byte_start,
-                                    byte_len: block_bytes,
-                                    buffer_len: raw_bytes.len(),
-                                    reason: "invalid Q8_0 block slice".to_owned(),
-                                })?;
-                        let d_bits = u16::from_le_bytes([block[0], block[1]]);
-                        let s = crate::f16_to_f32_finite(d_bits);
-                        #[expect(
-                            clippy::cast_possible_wrap,
-                            reason = "reinterpreting u8 quant as signed i8"
-                        )]
-                        for i in 0..32 {
-                            w_buf[i] = block[2 + i] as i8;
-                        }
-                        (&w_buf[..32], s)
-                    }
-                    _ => unreachable!(),
-                };
-
-                scales[j] = scale;
-                for ch in 0..k_chunks {
-                    let w_chunk = &w_slice[ch * TILE_K..(ch + 1) * TILE_K];
-                    let ch_base = ch * TILE_BYTES;
-                    b_tile[ch_base + j * TILE_K..ch_base + (j + 1) * TILE_K]
-                        .copy_from_slice(w_chunk);
-                }
-            }
+            pack_bitlinear_a_tile(act_sub, k_chunks, &mut a_tile);
+            pack_bitlinear_b_tile(
+                &pack_ctx,
+                r_base,
+                blk,
+                tile_rows,
+                &mut b_tile,
+                &mut scales,
+                &mut w_buf,
+            )?;
 
             // 3. Compute 8x8 Tile Dot Product
             let c = {
@@ -1142,5 +1210,69 @@ mod tests {
             tile_dot_rvv_rows(a_i8, b_i8, 2, 5, &mut rvv_partial);
             assert_eq!(rvv_partial, partial);
         }
+    }
+
+    #[test]
+    fn bitlinear_i8_i2_s_and_convert_to_tq2_0() {
+        let rows = 3_usize;
+        let cols = I2_S_BLOCK_ELEMENTS * 2;
+        let blocks_per_row = 2_usize;
+        let payload_len = rows * blocks_per_row * I2_S_BLOCK_BYTES;
+        let mut raw = vec![0_u8; payload_len + crate::quant::I2_S_SCALE_TRAILER_BYTES];
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let off = (r * blocks_per_row + b) * I2_S_BLOCK_BYTES;
+                for gp in 0..I2_S_BLOCK_BYTES {
+                    let t0 = u8::try_from((r + gp) % 3).unwrap();
+                    let t1 = u8::try_from((b + gp + 1) % 3).unwrap();
+                    let t2 = u8::try_from((r + b + gp) % 3).unwrap();
+                    let t3 = u8::try_from((gp + 2) % 3).unwrap();
+                    raw[off + gp] = (t0 << 6) | (t1 << 4) | (t2 << 2) | t3;
+                }
+            }
+        }
+        raw[payload_len..payload_len + 4].copy_from_slice(&0.25_f32.to_le_bytes());
+
+        let dims = [cols, rows];
+        let view = TensorView::from_bytes("i2s_w", QuantType::I2_S, &dims, 0, &raw)
+            .expect("valid I2_S view");
+        let act_i8: Vec<i8> = (0..cols)
+            .map(|i| i8::try_from(i % 15).unwrap() - 7)
+            .collect();
+        let act_scale = 0.5_f32;
+
+        let mut out_rvv = vec![0.0_f32; rows];
+        let mut out_ime = vec![0.0_f32; rows];
+        bitlinear_i8_rvv(&mut out_rvv, &view, &act_i8, act_scale).unwrap();
+        bitlinear_i8_ime(&mut out_ime, &view, &act_i8, act_scale).unwrap();
+        assert_eq!(out_rvv, out_ime);
+
+        // Verify against dequantized oracle
+        let mut w_f32 = vec![0.0_f32; cols];
+        for (r, &got) in out_rvv.iter().enumerate() {
+            crate::quant::dequantize_tensor_row(&view, r, &mut w_f32).unwrap();
+            let expected: f32 = w_f32
+                .iter()
+                .zip(&act_i8)
+                .map(|(&wf, &ai)| wf * (f32::from(ai) * act_scale))
+                .sum();
+            assert!((got - expected).abs() < 1e-4);
+        }
+
+        // Convert two I2_S blocks to TQ2_0 and verify identical unpacked trits
+        let blk0: &[u8; I2_S_BLOCK_BYTES] = raw[0..32].try_into().unwrap();
+        let blk1: &[u8; I2_S_BLOCK_BYTES] = raw[32..64].try_into().unwrap();
+        let mut tq2 = [0_u8; TQ2_0_BLOCK_BYTES];
+        convert_i2_s_blocks_to_tq2_0(blk0, blk1, 0x3800, &mut tq2); // 0.5_f16
+        let mut unpacked_tq2 = [0_i8; TQ2_0_BLOCK_ELEMENTS];
+        let scale = unpack_tq2_0_block_i8(&tq2, &mut unpacked_tq2);
+        assert!((scale - 0.5).abs() < 1e-6);
+
+        let mut expected0 = [0_i8; I2_S_BLOCK_ELEMENTS];
+        let mut expected1 = [0_i8; I2_S_BLOCK_ELEMENTS];
+        unpack_i2_s_block_i8(blk0, &mut expected0);
+        unpack_i2_s_block_i8(blk1, &mut expected1);
+        assert_eq!(&unpacked_tq2[..128], &expected0[..]);
+        assert_eq!(&unpacked_tq2[128..], &expected1[..]);
     }
 }

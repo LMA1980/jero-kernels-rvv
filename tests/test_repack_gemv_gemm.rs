@@ -14,13 +14,18 @@
 use jero_core::{K3Error, QuantType, TensorView};
 use jero_kernels_rvv::ime::{gemm_i8_ime, tile_dot_scalar};
 use jero_kernels_rvv::{
-    Aligned128, AlignedQuantMatrix, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_K_M_BLOCK_BYTES,
-    Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, QuantizedActQ8, RepackedWeight,
-    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, bf16_to_f32_finite, dequantize_q4_0_block,
-    dequantize_q4_k_m_block, dequantize_q5_k_block, dequantize_q6_k_block, dequantize_q8_0_block,
-    dot_product_f32_scalar, f16_to_f32_finite, gemm_repacked, gemm_repacked_f32,
-    gemm_repacked_rows, gemm_repacked_vla_sim, gemv_repacked, gemv_repacked_rows,
-    pack_tiles_aligned128, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0,
+    Aligned128, AlignedQuantMatrix, I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMENTS,
+    I2_S_SCALE_TRAILER_BYTES, IQ4_NL_BLOCK_BYTES, Q2_K_BLOCK_BYTES, Q3_K_BLOCK_BYTES,
+    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_1_BLOCK_BYTES, Q4_K_M_BLOCK_BYTES, Q5_0_BLOCK_BYTES,
+    Q5_1_BLOCK_BYTES, Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, QuantizedActQ8,
+    RepackedWeight, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, bf16_to_f32_finite,
+    dequantize_i2_s_row_with_scale, dequantize_iq4_nl_block, dequantize_q2_k_block,
+    dequantize_q3_k_block, dequantize_q4_0_block, dequantize_q4_1_block, dequantize_q4_k_m_block,
+    dequantize_q5_0_block, dequantize_q5_1_block, dequantize_q5_k_block, dequantize_q6_k_block,
+    dequantize_q8_0_block, dequantize_row_bytes, dequantize_tensor_row, dot_product_f32_scalar,
+    f16_to_f32_finite, gemm_repacked, gemm_repacked_f32, gemm_repacked_rows, gemm_repacked_vla_sim,
+    gemv_repacked, gemv_repacked_rows, pack_tiles_aligned128, read_i2_s_trailer_scale,
+    repack_q5_0_to_ime_8x16, vec_dot_bf16, vec_dot_f16, vec_dot_q4_0,
 };
 
 fn f32_to_f16_bits(val: f32) -> u16 {
@@ -140,6 +145,146 @@ fn build_synthetic_quant_tensor(quant: QuantType, rows: usize, cols: usize, seed
             }
             raw
         }
+        QuantType::Q4_1 => {
+            let n_blks = cols / 32;
+            let mut raw = vec![0_u8; rows * n_blks * Q4_1_BLOCK_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q4_1_BLOCK_BYTES;
+                    let d = 0.0625_f32 * (1.0 + ((r + b) % 4) as f32 * 0.5);
+                    let m = -0.25_f32 + ((r * 3 + b) % 5) as f32 * 0.125;
+                    raw[off..off + 2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    raw[off + 2..off + 4].copy_from_slice(&f32_to_f16_bits(m).to_le_bytes());
+                    for i in 0..16 {
+                        let lo = ((r * 7 + b * 3 + i + usize::from(seed)) & 0x0F) as u8;
+                        let hi = ((r * 11 + b * 5 + i * 3 + usize::from(seed)) & 0x0F) as u8;
+                        raw[off + 4 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+            raw
+        }
+        QuantType::Q5_0 => {
+            let n_blks = cols / 32;
+            let mut raw = vec![0_u8; rows * n_blks * Q5_0_BLOCK_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q5_0_BLOCK_BYTES;
+                    let d = 0.0625_f32 * (1.0 + ((r + b) % 4) as f32 * 0.25);
+                    raw[off..off + 2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    let qh = ((r as u32).wrapping_mul(0x9E37_79B1))
+                        ^ ((b as u32).wrapping_mul(0x85EB_CA77))
+                        ^ u32::from(seed).wrapping_mul(0x0101_0101);
+                    raw[off + 2..off + 6].copy_from_slice(&qh.to_le_bytes());
+                    for i in 0..16 {
+                        let lo = ((r * 5 + b * 9 + i + usize::from(seed)) & 0x0F) as u8;
+                        let hi = ((r * 13 + b * 3 + i * 5 + usize::from(seed)) & 0x0F) as u8;
+                        raw[off + 6 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+            raw
+        }
+        QuantType::Q5_1 => {
+            let n_blks = cols / 32;
+            let mut raw = vec![0_u8; rows * n_blks * Q5_1_BLOCK_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q5_1_BLOCK_BYTES;
+                    let d = 0.0625_f32 * (1.0 + ((r + b) % 3) as f32 * 0.25);
+                    let m = -0.25_f32 + ((r * 2 + b * 3) % 7) as f32 * 0.0625;
+                    raw[off..off + 2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    raw[off + 2..off + 4].copy_from_slice(&f32_to_f16_bits(m).to_le_bytes());
+                    let qh = ((r as u32).wrapping_mul(0x517C_C1B7))
+                        ^ ((b as u32).wrapping_mul(0x2722_0A95))
+                        ^ u32::from(seed);
+                    raw[off + 4..off + 8].copy_from_slice(&qh.to_le_bytes());
+                    for i in 0..16 {
+                        let lo = ((r * 9 + b * 7 + i + usize::from(seed)) & 0x0F) as u8;
+                        let hi = ((r * 3 + b * 11 + i * 7 + usize::from(seed)) & 0x0F) as u8;
+                        raw[off + 8 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+            raw
+        }
+        QuantType::Q2_K => {
+            let n_blks = cols / 256;
+            let mut raw = vec![0_u8; rows * n_blks * Q2_K_BLOCK_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q2_K_BLOCK_BYTES;
+                    for s in 0..16 {
+                        let sc = ((r * 5 + b * 3 + s + 1) % 15) as u8 + 1;
+                        let m = ((r * 3 + b * 7 + s + 2) % 13) as u8;
+                        raw[off + s] = (sc & 0x0F) | ((m & 0x0F) << 4);
+                    }
+                    for i in 0..64 {
+                        raw[off + 16 + i] =
+                            ((r * 17 + b * 11 + i * 5 + usize::from(seed)) & 0xFF) as u8;
+                    }
+                    raw[off + 80..off + 82].copy_from_slice(&f32_to_f16_bits(0.0625).to_le_bytes());
+                    raw[off + 82..off + 84]
+                        .copy_from_slice(&f32_to_f16_bits(0.03125).to_le_bytes());
+                }
+            }
+            raw
+        }
+        QuantType::Q3_K => {
+            let n_blks = cols / 256;
+            let mut raw = vec![0_u8; rows * n_blks * Q3_K_BLOCK_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q3_K_BLOCK_BYTES;
+                    for i in 0..96 {
+                        raw[off + i] = ((r * 13 + b * 7 + i * 9 + usize::from(seed)) & 0xFF) as u8;
+                    }
+                    for s in 0..12 {
+                        raw[off + 96 + s] =
+                            ((r * 19 + b * 23 + s * 11 + usize::from(seed) + 7) & 0xFF) as u8;
+                    }
+                    raw[off + 108..off + 110]
+                        .copy_from_slice(&f32_to_f16_bits(0.0625).to_le_bytes());
+                }
+            }
+            raw
+        }
+        QuantType::IQ4_NL => {
+            let n_blks = cols / 32;
+            let mut raw = vec![0_u8; rows * n_blks * IQ4_NL_BLOCK_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * IQ4_NL_BLOCK_BYTES;
+                    let d = 0.03125_f32 * (1.0 + ((r + b) % 4) as f32 * 0.25);
+                    raw[off..off + 2].copy_from_slice(&f32_to_f16_bits(d).to_le_bytes());
+                    for i in 0..16 {
+                        let lo = ((r * 5 + b * 3 + i + usize::from(seed)) & 0x0F) as u8;
+                        let hi = ((r * 7 + b * 9 + i * 3 + usize::from(seed)) & 0x0F) as u8;
+                        raw[off + 2 + i] = lo | (hi << 4);
+                    }
+                }
+            }
+            raw
+        }
+        QuantType::I2_S => {
+            let n_blks = cols / I2_S_BLOCK_ELEMENTS;
+            let payload_len = rows * n_blks * I2_S_BLOCK_BYTES;
+            let mut raw = vec![0_u8; payload_len + I2_S_SCALE_TRAILER_BYTES];
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * I2_S_BLOCK_BYTES;
+                    for gp in 0..32 {
+                        let t0 = ((r + gp + usize::from(seed)) % 3) as u8;
+                        let t1 = ((b + gp + 1 + usize::from(seed)) % 3) as u8;
+                        let t2 = ((r + b + gp + 2) % 3) as u8;
+                        let t3 = ((r * 3 + gp + 1) % 3) as u8;
+                        raw[off + gp] = (t0 << 6) | (t1 << 4) | (t2 << 2) | t3;
+                    }
+                }
+            }
+            raw[payload_len..payload_len + 4].copy_from_slice(&0.125_f32.to_le_bytes());
+            raw
+        }
         QuantType::Q4_K_M => {
             let n_blks = cols / 256;
             let mut raw = vec![0_u8; rows * n_blks * Q4_K_M_BLOCK_BYTES];
@@ -232,12 +377,15 @@ fn build_synthetic_quant_tensor(quant: QuantType, rows: usize, cols: usize, seed
                         let t1 = ((r + i + 1) % 3) as u8;
                         let t2 = ((b + i + 2) % 3) as u8;
                         let t3 = ((r + b + i) % 3) as u8;
-                        raw[off + i] = t0 | (t1 << 2) | (t2 << 4) | (t3 << 6);
+                        raw[off + 2 + i] = t0 | (t1 << 2) | (t2 << 4) | (t3 << 6);
                     }
-                    raw[off + 64..off + 66].copy_from_slice(&f32_to_f16_bits(0.25).to_le_bytes());
+                    raw[off..off + 2].copy_from_slice(&f32_to_f16_bits(0.25).to_le_bytes());
                 }
             }
             raw
+        }
+        QuantType::Q8_1 | QuantType::MXFP4 => {
+            unreachable!("{quant:?} is tested fail-closed outside synthetic GEMM")
         }
     }
 }
@@ -343,7 +491,114 @@ fn oracle_dequantize_matrix(quant: QuantType, raw: &[u8], rows: usize, cols: usi
                 }
             }
         }
-        QuantType::TQ1_0 | QuantType::TQ2_0 => unreachable!("handled in ternary test"),
+        QuantType::Q4_1 => {
+            let n_blks = cols / 32;
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q4_1_BLOCK_BYTES;
+                    let out_sub: &mut [f32; 32] = (&mut mat
+                        [r * cols + b * 32..r * cols + (b + 1) * 32])
+                        .try_into()
+                        .unwrap();
+                    dequantize_q4_1_block(
+                        raw[off..off + Q4_1_BLOCK_BYTES].try_into().unwrap(),
+                        out_sub,
+                    );
+                }
+            }
+        }
+        QuantType::Q5_0 => {
+            let n_blks = cols / 32;
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q5_0_BLOCK_BYTES;
+                    let out_sub: &mut [f32; 32] = (&mut mat
+                        [r * cols + b * 32..r * cols + (b + 1) * 32])
+                        .try_into()
+                        .unwrap();
+                    dequantize_q5_0_block(
+                        raw[off..off + Q5_0_BLOCK_BYTES].try_into().unwrap(),
+                        out_sub,
+                    );
+                }
+            }
+        }
+        QuantType::Q5_1 => {
+            let n_blks = cols / 32;
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q5_1_BLOCK_BYTES;
+                    let out_sub: &mut [f32; 32] = (&mut mat
+                        [r * cols + b * 32..r * cols + (b + 1) * 32])
+                        .try_into()
+                        .unwrap();
+                    dequantize_q5_1_block(
+                        raw[off..off + Q5_1_BLOCK_BYTES].try_into().unwrap(),
+                        out_sub,
+                    );
+                }
+            }
+        }
+        QuantType::Q2_K => {
+            let n_blks = cols / 256;
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q2_K_BLOCK_BYTES;
+                    let out_sub: &mut [f32; 256] = (&mut mat
+                        [r * cols + b * 256..r * cols + (b + 1) * 256])
+                        .try_into()
+                        .unwrap();
+                    dequantize_q2_k_block(
+                        raw[off..off + Q2_K_BLOCK_BYTES].try_into().unwrap(),
+                        out_sub,
+                    );
+                }
+            }
+        }
+        QuantType::Q3_K => {
+            let n_blks = cols / 256;
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * Q3_K_BLOCK_BYTES;
+                    let out_sub: &mut [f32; 256] = (&mut mat
+                        [r * cols + b * 256..r * cols + (b + 1) * 256])
+                        .try_into()
+                        .unwrap();
+                    dequantize_q3_k_block(
+                        raw[off..off + Q3_K_BLOCK_BYTES].try_into().unwrap(),
+                        out_sub,
+                    );
+                }
+            }
+        }
+        QuantType::IQ4_NL => {
+            let n_blks = cols / 32;
+            for r in 0..rows {
+                for b in 0..n_blks {
+                    let off = (r * n_blks + b) * IQ4_NL_BLOCK_BYTES;
+                    let out_sub: &mut [f32; 32] = (&mut mat
+                        [r * cols + b * 32..r * cols + (b + 1) * 32])
+                        .try_into()
+                        .unwrap();
+                    dequantize_iq4_nl_block(
+                        raw[off..off + IQ4_NL_BLOCK_BYTES].try_into().unwrap(),
+                        out_sub,
+                    );
+                }
+            }
+        }
+        QuantType::I2_S => {
+            let row_bytes = (cols / I2_S_BLOCK_ELEMENTS) * I2_S_BLOCK_BYTES;
+            let scale = read_i2_s_trailer_scale(&raw[rows * row_bytes..]);
+            for r in 0..rows {
+                let row_raw = &raw[r * row_bytes..(r + 1) * row_bytes];
+                dequantize_i2_s_row_with_scale(row_raw, scale, &mut mat[r * cols..(r + 1) * cols])
+                    .unwrap();
+            }
+        }
+        QuantType::TQ1_0 | QuantType::TQ2_0 | QuantType::Q8_1 | QuantType::MXFP4 => {
+            unreachable!("handled outside oracle matrix dequantizer")
+        }
     }
     mat
 }
@@ -659,4 +914,112 @@ fn test_repack_and_gemm_bounds_errors() {
         gemm_repacked(&mut short_out, &repacked, &ok_act),
         Err(K3Error::TensorBoundsError { .. })
     ));
+}
+
+#[test]
+fn test_wave2_new_quants_repack_gemv_gemm_and_row_dequant() {
+    let quants = [
+        (QuantType::Q4_1, 256_usize, 19_usize, 1.5e-2_f64),
+        (QuantType::Q5_0, 256, 21, 1.2e-2),
+        (QuantType::Q5_1, 256, 17, 1.5e-2),
+        (QuantType::Q2_K, 512, 15, 2.0e-2),
+        (QuantType::Q3_K, 512, 19, 1.5e-2),
+        (QuantType::IQ4_NL, 256, 23, 1.5e-2),
+        (QuantType::I2_S, 256, 17, 1.5e-2),
+    ];
+
+    for (q_idx, &(quant, cols, rows, max_rel_l2)) in quants.iter().enumerate() {
+        let raw = build_synthetic_quant_tensor(quant, rows, cols, (q_idx + 17) as u8);
+        let shape = [cols, rows];
+        let view = TensorView::from_bytes("w_wave2", quant, &shape, 0, &raw).unwrap();
+        let repacked = if quant == QuantType::Q5_0 {
+            repack_q5_0_to_ime_8x16(&view).unwrap()
+        } else {
+            RepackedWeight::from_tensor(&view, rows, cols).unwrap()
+        };
+        let oracle_w = oracle_dequantize_matrix(quant, &raw, rows, cols);
+
+        let mut row_repacked = vec![0.0_f32; cols];
+        let mut row_tensor = vec![0.0_f32; cols];
+        let mut row_bytes_out = vec![0.0_f32; cols];
+        let expected_row_stride = (cols / quant.block_elements()) * quant.block_bytes();
+        for r in [0_usize, rows / 2, rows - 1] {
+            repacked.dequantize_row(r, &mut row_repacked).unwrap();
+            dequantize_tensor_row(&view, r, &mut row_tensor).unwrap();
+            if quant != QuantType::I2_S {
+                let off = r * expected_row_stride;
+                dequantize_row_bytes(
+                    quant,
+                    &raw[off..off + expected_row_stride],
+                    cols,
+                    &mut row_bytes_out,
+                )
+                .unwrap();
+                assert_eq!(row_bytes_out, row_tensor);
+            }
+            for c in 0..cols {
+                assert!(
+                    (row_repacked[c] - oracle_w[r * cols + c]).abs() < 1e-4,
+                    "{quant:?} repacked row {r} col {c}"
+                );
+                assert!(
+                    (row_tensor[c] - oracle_w[r * cols + c]).abs() < 1e-5,
+                    "{quant:?} tensor row {r} col {c}"
+                );
+            }
+        }
+
+        for &m in &[1_usize, 5, 8, 17, 64] {
+            let x = make_activations(m, cols, 300 + q_idx * 10 + m);
+            let act = QuantizedActQ8::quantize(&x, m, cols).unwrap();
+            let expected = oracle_gemm_f32(&oracle_w, &x, m, rows, cols);
+
+            let mut actual = vec![0.0_f32; m * rows];
+            gemm_repacked(&mut actual, &repacked, &act).unwrap();
+
+            let (cos, rel_l2) = cosine_similarity_and_rel_l2(&actual, &expected);
+            assert!(
+                cos > 0.999,
+                "{quant:?} M={m} cosine similarity {cos} <= 0.999"
+            );
+            assert!(
+                rel_l2 < max_rel_l2,
+                "{quant:?} M={m} relative L2 error {rel_l2} >= {max_rel_l2}"
+            );
+
+            let mut vla256 = vec![0.0_f32; m * rows];
+            let mut vla1024 = vec![0.0_f32; m * rows];
+            gemm_repacked_vla_sim(&mut vla256, &repacked, &act, 256).unwrap();
+            gemm_repacked_vla_sim(&mut vla1024, &repacked, &act, 1024).unwrap();
+            assert_eq!(vla256, vla1024, "{quant:?} M={m} 256b vs 1024b mismatch");
+        }
+    }
+
+    // TQ1_0 / TQ2_0 row dequant and fail-closed Q8_1 / MXFP4 rejection
+    for &tq in &[QuantType::TQ1_0, QuantType::TQ2_0] {
+        let raw = build_synthetic_quant_tensor(tq, 2, 256, 4);
+        let view = TensorView::from_bytes("w_tq", tq, &[256, 2], 0, &raw).unwrap();
+        let repacked = RepackedWeight::repack(&view).unwrap();
+        let mut r_rep = vec![0.0_f32; 256];
+        let mut r_ten = vec![0.0_f32; 256];
+        repacked.dequantize_row(1, &mut r_rep).unwrap();
+        dequantize_tensor_row(&view, 1, &mut r_ten).unwrap();
+        for c in 0..256 {
+            assert!((r_rep[c] - r_ten[c]).abs() < 1e-6);
+        }
+    }
+
+    for &unsupported in &[QuantType::Q8_1, QuantType::MXFP4] {
+        let raw = vec![0_u8; unsupported.block_bytes()];
+        let view = TensorView::from_bytes("unsupported_w", unsupported, &[32, 1], 0, &raw).unwrap();
+        assert!(matches!(
+            RepackedWeight::repack(&view),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        let mut out = [0.0_f32; 32];
+        assert!(matches!(
+            dequantize_tensor_row(&view, 0, &mut out),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+    }
 }

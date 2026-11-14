@@ -26,8 +26,8 @@ pub use attention::{
 pub use ime::tile_dot_rvv;
 pub use ime::{
     TQ1_0_BLOCK_BYTES, TQ1_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES, TQ2_0_BLOCK_ELEMENTS,
-    bitlinear_i8_ime, bitlinear_i8_rvv, pack_tiles_aligned128, unpack_tq1_0_block_i8,
-    unpack_tq2_0_block_i8,
+    bitlinear_i8_ime, bitlinear_i8_rvv, convert_i2_s_blocks_to_tq2_0, pack_tiles_aligned128,
+    unpack_tq1_0_block_i8, unpack_tq2_0_block_i8,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::rmsnorm_unit_offset_rvv;
@@ -37,14 +37,26 @@ pub use norm::{
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::{l2_norm_f32_in_place_rvv, l2_norm_f32_rvv};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use quant::dequantize_iq4_nl_row_rvv;
 pub use quant::{
-    Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
-    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, dequantize_q4_0_block,
-    dequantize_q5_k_block, dequantize_q5_k_block_struct, dequantize_q6_k_block,
-    dequantize_q8_0_block, dequantize_token_row, matvec_q5_k, matvec_q5_k_slice,
-    validate_q5_k_dimensions, vec_dot_bf16, vec_dot_bf16_scalar, vec_dot_f16, vec_dot_f16_scalar,
-    vec_dot_q4_0, vec_dot_q4_0_scalar, vec_dot_q5_k, vec_dot_q5_k_scalar, vec_dot_q6_k,
-    vec_dot_q6_k_scalar, vec_dot_q8_0, vec_dot_q8_0_scalar,
+    I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMENTS, I2_S_SCALE_TRAILER_BYTES, IQ4_NL_BLOCK_BYTES,
+    IQ4_NL_BLOCK_ELEMENTS, KVALUES_IQ4NL, Q2_K_BLOCK_BYTES, Q2_K_BLOCK_ELEMENTS, Q3_K_BLOCK_BYTES,
+    Q3_K_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_1_BLOCK_BYTES,
+    Q4_1_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMENTS, Q5_1_BLOCK_BYTES,
+    Q5_1_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
+    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, dequantize_i2_s_block,
+    dequantize_i2_s_row_with_scale, dequantize_iq4_nl_block, dequantize_q2_k_block,
+    dequantize_q3_k_block, dequantize_q4_0_block, dequantize_q4_1_block, dequantize_q5_0,
+    dequantize_q5_0_block, dequantize_q5_1_block, dequantize_q5_k_block,
+    dequantize_q5_k_block_struct, dequantize_q6_k_block, dequantize_q8_0_block,
+    dequantize_row_bytes, dequantize_tensor_row, dequantize_token_row, matvec_q5_k,
+    matvec_q5_k_slice, read_i2_s_trailer_scale, unpack_i2_s_block_i8, unpack_iq4_nl_block_i8,
+    unpack_q2_k_block_i8, unpack_q3_k_block_i8, unpack_q4_1_block_i8, unpack_q5_0_block_i8,
+    unpack_q5_1_block_i8, validate_q5_k_dimensions, vec_dot_bf16, vec_dot_bf16_scalar, vec_dot_f16,
+    vec_dot_f16_scalar, vec_dot_i2_s, vec_dot_iq4_nl, vec_dot_q2_k, vec_dot_q3_k, vec_dot_q4_0,
+    vec_dot_q4_0_scalar, vec_dot_q4_1, vec_dot_q5_0, vec_dot_q5_0_q8_0, vec_dot_q5_1, vec_dot_q5_k,
+    vec_dot_q5_k_scalar, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0, vec_dot_q8_0_scalar,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use quant::{
@@ -57,7 +69,7 @@ pub use repack::{
     Aligned128, AlignedQuantMatrix, QuantizedActQ8, RepackedWeight, gemm_repacked,
     gemm_repacked_f32, gemm_repacked_f32_rows, gemm_repacked_rows, gemm_repacked_vla_sim,
     gemv_repacked, gemv_repacked_f32, gemv_repacked_f32_rows, gemv_repacked_rows,
-    quantize_row_f32_to_q8_32, quantize_row_f32_to_q8_32_scalar,
+    quantize_row_f32_to_q8_32, quantize_row_f32_to_q8_32_scalar, repack_q5_0_to_ime_8x16,
 };
 pub use residual::{
     ngpt_residual_lerp_f32, ngpt_residual_lerp_f32_scalar, ngpt_residual_lerp_in_place,
