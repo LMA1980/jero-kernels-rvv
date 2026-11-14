@@ -1,7 +1,9 @@
 //! Activation quantization (`BlockQ8_0`, `BlockQ8K`) and direct integer `Q*_x_Q8` multi-row
 //! `M = 1` GEMV kernels for VLA RVV 1.0 (`VLEN=128/256/1024`) and portable scalar fallback.
 
-use jero_core::{K3Error, QuantType, TensorView};
+use jero_core::{
+    K3Error, QuantType, SCRATCH_ALIGNMENT, ScratchScope, ScratchWorkspace, TensorView,
+};
 
 use crate::f16_to_f32_finite;
 #[cfg(any(not(target_arch = "riscv64"), miri))]
@@ -106,10 +108,10 @@ fn round_scaled_to_i8(val: f32, inv_scale: f32) -> i8 {
 }
 
 #[inline]
-fn validate_activation_quant_slice(
+fn validate_activation_input(
     name: &str,
     x_len: usize,
-    out_len: usize,
+    out_len_hint: usize,
     block_elems: usize,
 ) -> Result<usize, K3Error> {
     if x_len == 0 || x_len % block_elems != 0 {
@@ -117,13 +119,23 @@ fn validate_activation_quant_slice(
             tensor_name: name.to_owned(),
             offset: 0,
             byte_len: x_len * size_of::<f32>(),
-            buffer_len: out_len,
+            buffer_len: out_len_hint,
             reason: format!(
                 "{name}: input length {x_len} must be a positive multiple of {block_elems}"
             ),
         });
     }
-    let n_blocks = x_len / block_elems;
+    Ok(x_len / block_elems)
+}
+
+#[inline]
+fn validate_activation_quant_slice(
+    name: &str,
+    x_len: usize,
+    out_len: usize,
+    block_elems: usize,
+) -> Result<usize, K3Error> {
+    let n_blocks = validate_activation_input(name, x_len, out_len, block_elems)?;
     if out_len != n_blocks {
         return Err(K3Error::TensorBoundsError {
             tensor_name: name.to_owned(),
@@ -134,6 +146,57 @@ fn validate_activation_quant_slice(
         });
     }
     Ok(n_blocks)
+}
+
+const Q8_0_BLOCK_F32S: usize = size_of::<BlockQ8_0>() / size_of::<f32>();
+const Q8_K_BLOCK_F32S: usize = size_of::<BlockQ8K>() / size_of::<f32>();
+
+const _: () = {
+    assert!(size_of::<BlockQ8_0>() == size_of::<f32>() + Q8_0_BLOCK_ELEMENTS);
+    assert!(size_of::<BlockQ8_0>() % size_of::<f32>() == 0);
+    assert!(align_of::<BlockQ8_0>() == align_of::<f32>());
+    assert!(align_of::<BlockQ8_0>() <= SCRATCH_ALIGNMENT);
+    assert!(
+        size_of::<BlockQ8K>() == size_of::<f32>() + Q8_K_BLOCK_ELEMENTS + 16 * size_of::<i16>()
+    );
+    assert!(size_of::<BlockQ8K>() % size_of::<f32>() == 0);
+    assert!(align_of::<BlockQ8K>() == align_of::<f32>());
+    assert!(align_of::<BlockQ8K>() <= SCRATCH_ALIGNMENT);
+};
+
+#[inline]
+fn f32_scratch_as_blocks_mut<B>(raw: &mut [f32], n_blocks: usize) -> &mut [B] {
+    assert_eq!(
+        size_of_val(raw),
+        n_blocks * size_of::<B>(),
+        "scratch slice byte length mismatch for quantized block buffer"
+    );
+    assert_eq!(
+        raw.as_ptr() as usize % align_of::<B>(),
+        0,
+        "scratch slice alignment mismatch for quantized block buffer"
+    );
+    // SAFETY: `raw` originates from `ScratchWorkspace`/`ScratchScope::alloc_f32` (`128B`
+    // aligned >= `align_of::<B>()`), holds `n_blocks * size_of::<B>()` exclusively borrowed bytes,
+    // and both `BlockQ8_0` and `BlockQ8K` are `#[repr(C)]` zero-padding scalar-field structs.
+    unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr().cast::<B>(), n_blocks) }
+}
+
+#[inline]
+fn scratch_f32_elem_count(
+    name: &str,
+    n_blocks: usize,
+    f32s_per_block: usize,
+) -> Result<usize, K3Error> {
+    n_blocks
+        .checked_mul(f32s_per_block)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: name.to_owned(),
+            offset: 0,
+            byte_len: usize::MAX,
+            buffer_len: 0,
+            reason: format!("{name}: scratch block buffer element count overflow"),
+        })
 }
 
 #[inline]
@@ -333,6 +396,53 @@ pub fn quantize_row_q8_0(x: &[f32], out: &mut [BlockQ8_0]) -> Result<(), K3Error
     quantize_row_q8_0_f32(x, out)
 }
 
+/// Quantizes `x` into `BlockQ8_0` blocks carved from `scratch` with zero heap allocations.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `x` is empty, not a multiple of `32`, or exceeds
+/// `scratch` remaining capacity.
+pub fn quantize_row_q8_0_in_scratch<'a>(
+    x: &[f32],
+    scratch: &'a mut ScratchWorkspace,
+) -> Result<&'a [BlockQ8_0], K3Error> {
+    let n_blocks = validate_activation_input(
+        "quantize_row_q8_0_in_scratch",
+        x.len(),
+        0,
+        Q8_0_BLOCK_ELEMENTS,
+    )?;
+    let f32_len =
+        scratch_f32_elem_count("quantize_row_q8_0_in_scratch", n_blocks, Q8_0_BLOCK_F32S)?;
+    let raw = scratch.alloc_f32(f32_len)?;
+    let blocks = f32_scratch_as_blocks_mut::<BlockQ8_0>(raw, n_blocks);
+    quantize_row_q8_0_f32(x, blocks)?;
+    Ok(blocks)
+}
+
+/// Quantizes `x` into `BlockQ8_0` blocks carved from `scope` with zero heap allocations.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `x` is empty, not a multiple of `32`, or exceeds
+/// `scope` remaining capacity.
+pub fn quantize_row_q8_0_in_scope<'a>(
+    x: &[f32],
+    scope: &'a ScratchScope<'_>,
+) -> Result<&'a [BlockQ8_0], K3Error> {
+    let n_blocks = validate_activation_input(
+        "quantize_row_q8_0_in_scope",
+        x.len(),
+        0,
+        Q8_0_BLOCK_ELEMENTS,
+    )?;
+    let f32_len = scratch_f32_elem_count("quantize_row_q8_0_in_scope", n_blocks, Q8_0_BLOCK_F32S)?;
+    let raw = scope.alloc_f32(f32_len)?;
+    let blocks = f32_scratch_as_blocks_mut::<BlockQ8_0>(raw, n_blocks);
+    quantize_row_q8_0_f32(x, blocks)?;
+    Ok(blocks)
+}
+
 #[inline]
 fn quantize_block_q8_k_scalar(x: &[f32], blk: &mut BlockQ8K) {
     let amax = x
@@ -481,6 +591,53 @@ pub fn quantize_row_q8_k(x: &[f32], out: &mut [BlockQ8K]) -> Result<(), K3Error>
         }
     }
     Ok(())
+}
+
+/// Quantizes `x` into `BlockQ8K` super-blocks carved from `scratch` with zero heap allocations.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `x` is empty, not a multiple of `256`, or exceeds
+/// `scratch` remaining capacity.
+pub fn quantize_row_q8_k_in_scratch<'a>(
+    x: &[f32],
+    scratch: &'a mut ScratchWorkspace,
+) -> Result<&'a [BlockQ8K], K3Error> {
+    let n_blocks = validate_activation_input(
+        "quantize_row_q8_k_in_scratch",
+        x.len(),
+        0,
+        Q8_K_BLOCK_ELEMENTS,
+    )?;
+    let f32_len =
+        scratch_f32_elem_count("quantize_row_q8_k_in_scratch", n_blocks, Q8_K_BLOCK_F32S)?;
+    let raw = scratch.alloc_f32(f32_len)?;
+    let blocks = f32_scratch_as_blocks_mut::<BlockQ8K>(raw, n_blocks);
+    quantize_row_q8_k(x, blocks)?;
+    Ok(blocks)
+}
+
+/// Quantizes `x` into `BlockQ8K` super-blocks carved from `scope` with zero heap allocations.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `x` is empty, not a multiple of `256`, or exceeds
+/// `scope` remaining capacity.
+pub fn quantize_row_q8_k_in_scope<'a>(
+    x: &[f32],
+    scope: &'a ScratchScope<'_>,
+) -> Result<&'a [BlockQ8K], K3Error> {
+    let n_blocks = validate_activation_input(
+        "quantize_row_q8_k_in_scope",
+        x.len(),
+        0,
+        Q8_K_BLOCK_ELEMENTS,
+    )?;
+    let f32_len = scratch_f32_elem_count("quantize_row_q8_k_in_scope", n_blocks, Q8_K_BLOCK_F32S)?;
+    let raw = scope.alloc_f32(f32_len)?;
+    let blocks = f32_scratch_as_blocks_mut::<BlockQ8K>(raw, n_blocks);
+    quantize_row_q8_k(x, blocks)?;
+    Ok(blocks)
 }
 
 #[inline]
@@ -3613,5 +3770,58 @@ mod tests {
             assert!((ot1[r] - s1).abs() < 1e-4);
             assert!((ot2[r] - s2).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn test_quantize_row_q8_scratch_and_scope_parity_and_errors() {
+        let mut x0 = test_f32_row(64, 5);
+        x0[5] = f32::NAN;
+        x0[33] = f32::INFINITY;
+        let mut expected_0 = [BlockQ8_0::ZERO; 2];
+        quantize_row_q8_0(&x0, &mut expected_0).expect("ref q8_0");
+
+        let mut xk = test_f32_row(256, 3);
+        xk[7] = f32::NEG_INFINITY;
+        let mut expected_k = [BlockQ8K::ZERO; 1];
+        quantize_row_q8_k(&xk, &mut expected_k).expect("ref q8_k");
+
+        let mut ws = ScratchWorkspace::new(2048).expect("workspace");
+        {
+            let scope = ws.scope();
+            let scoped_0 = quantize_row_q8_0_in_scope(&x0, &scope).expect("q8_0 in scope");
+            let scoped_k = quantize_row_q8_k_in_scope(&xk, &scope).expect("q8_k in scope");
+            assert_eq!(scoped_0, &expected_0);
+            assert_eq!(scoped_k, &expected_k);
+        }
+
+        // Reuse workspace after scope drop & reset via in_scratch helpers.
+        ws.reset();
+        let scratch_0 = quantize_row_q8_0_in_scratch(&x0, &mut ws).expect("q8_0 in scratch");
+        assert_eq!(scratch_0, &expected_0);
+        ws.reset();
+        let scratch_k = quantize_row_q8_k_in_scratch(&xk, &mut ws).expect("q8_k in scratch");
+        assert_eq!(scratch_k, &expected_k);
+
+        // Validation failures leave cursor intact and fail closed.
+        ws.reset();
+        assert!(matches!(
+            quantize_row_q8_0_in_scratch(&[], &mut ws),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            quantize_row_q8_0_in_scratch(&[1.0; 31], &mut ws),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert!(matches!(
+            quantize_row_q8_k_in_scratch(&[1.0; 128], &mut ws),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        assert_eq!(ws.used_bytes(), 0);
+
+        let mut tiny = ScratchWorkspace::new(16).expect("tiny workspace");
+        assert!(matches!(
+            quantize_row_q8_0_in_scratch(&x0, &mut tiny),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
     }
 }

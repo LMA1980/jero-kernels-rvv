@@ -5,7 +5,7 @@
 //! definitions and matrix-vector dot dispatchers for both VLA RVV 1.0 and portable scalar execution.
 
 #[path = "quant_q8.rs"]
-mod quant_q8;
+pub mod quant_q8;
 pub use quant_q8::*;
 
 use jero_core::{BlockQ5_K, K3Error, QuantType, TensorView};

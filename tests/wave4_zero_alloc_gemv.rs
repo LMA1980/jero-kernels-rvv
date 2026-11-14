@@ -9,19 +9,21 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use jero_core::{QuantType, TensorView};
+use jero_core::{QuantType, ScratchWorkspace, TensorView};
 use jero_kernels_rvv::{
     BaselineKernel, BlockQ8_0, BlockQ8K, Q4_0_BLOCK_BYTES, Q4_K_M_BLOCK_BYTES, Q5_0_BLOCK_BYTES,
-    Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, QuantizedActQ8, RepackedWeight,
-    TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, VectorKernel, argmax_f32, gemm_repacked, gemv_q4_0_q8_0,
-    gemv_q4_0_q8_0_4x, gemv_q4_k_q8_k, gemv_q5_0_q8_0, gemv_q5_0_q8_0_4x, gemv_q5_k_q8_k,
-    gemv_q6_k_q8_k, gemv_q8_0_q8_0, gemv_q8_0_q8_0_4x, gemv_repacked, gemv_tq1_0_q8_k,
+    Q5_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, Q8_0_BLOCK_BYTES, QuantizedActQ8, QuantizedActQ8View,
+    RepackedWeight, TQ1_0_BLOCK_BYTES, TQ2_0_BLOCK_BYTES, VectorKernel, argmax_f32, gemm_repacked,
+    gemv_q4_0_q8_0, gemv_q4_0_q8_0_4x, gemv_q4_k_q8_k, gemv_q5_0_q8_0, gemv_q5_0_q8_0_4x,
+    gemv_q5_k_q8_k, gemv_q6_k_q8_k, gemv_q8_0_q8_0, gemv_q8_0_q8_0_4x, gemv_repacked,
+    gemv_repacked_rows, gemv_repacked_view, gemv_repacked_view_rows, gemv_tq1_0_q8_k,
     gemv_tq2_0_q8_k, mamba2_conv1d_silu_chunk_f32, mamba2_ssd_chunk_scan_f32,
-    mamba2_ssd_intra_chunk_ime_i8, quantize_row_q8_0, quantize_row_q8_0_f32, quantize_row_q8_k,
-    rwkv_token_shift_lerp_sequence_f32, rwkv7_wkv_delta_rule_sequence_f32, vec_dot_q4_0,
-    vec_dot_q4_0_q8_0, vec_dot_q4_k_q8_k, vec_dot_q5_0, vec_dot_q5_0_q8_0_blocks, vec_dot_q5_k,
-    vec_dot_q5_k_q8_k, vec_dot_q6_k, vec_dot_q6_k_q8_k, vec_dot_q8_0, vec_dot_q8_0_q8_0,
-    vec_dot_tq1_0_q8_k, vec_dot_tq2_0_q8_k,
+    mamba2_ssd_intra_chunk_ime_i8, quantize_row_q8_0, quantize_row_q8_0_f32,
+    quantize_row_q8_0_in_scope, quantize_row_q8_0_in_scratch, quantize_row_q8_k,
+    quantize_row_q8_k_in_scope, quantize_row_q8_k_in_scratch, rwkv_token_shift_lerp_sequence_f32,
+    rwkv7_wkv_delta_rule_sequence_f32, vec_dot_q4_0, vec_dot_q4_0_q8_0, vec_dot_q4_k_q8_k,
+    vec_dot_q5_0, vec_dot_q5_0_q8_0_blocks, vec_dot_q5_k, vec_dot_q5_k_q8_k, vec_dot_q6_k,
+    vec_dot_q6_k_q8_k, vec_dot_q8_0, vec_dot_q8_0_q8_0, vec_dot_tq1_0_q8_k, vec_dot_tq2_0_q8_k,
 };
 
 struct CountingAllocator;
@@ -262,4 +264,160 @@ fn wave4_ssm_and_rwkv7_chunk_scans_perform_zero_heap_allocations() {
         bytes, 0,
         "expected 0 heap allocations in SSM/RWKV7 chunk kernels"
     );
+}
+
+fn build_wave4_q4_weights(rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
+    let blocks_32 = cols / 32;
+    let blocks_256 = cols / 256;
+
+    let mut w_q4_0 = vec![0_u8; rows * blocks_32 * Q4_0_BLOCK_BYTES];
+    for r in 0..rows {
+        for b in 0..blocks_32 {
+            let off = (r * blocks_32 + b) * Q4_0_BLOCK_BYTES;
+            w_q4_0[off..off + 2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            for (j, byte) in w_q4_0[off + 2..off + Q4_0_BLOCK_BYTES]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = u8::try_from(((r * 13 + b * 7 + j * 5) & 0xFF) ^ 0x5A).unwrap_or(0);
+            }
+        }
+    }
+    let mut w_q4_k = vec![0_u8; rows * blocks_256 * Q4_K_M_BLOCK_BYTES];
+    for r in 0..rows {
+        for sb in 0..blocks_256 {
+            let off = (r * blocks_256 + sb) * Q4_K_M_BLOCK_BYTES;
+            w_q4_k[off..off + 2].copy_from_slice(&0x3800_u16.to_le_bytes());
+            w_q4_k[off + 2..off + 4].copy_from_slice(&0x3400_u16.to_le_bytes());
+            for (j, byte) in w_q4_k[off + 4..off + Q4_K_M_BLOCK_BYTES]
+                .iter_mut()
+                .enumerate()
+            {
+                *byte = u8::try_from((r * 11 + sb * 3 + j * 7 + 1) & 0xFF).unwrap_or(0);
+            }
+        }
+    }
+    (w_q4_0, w_q4_k)
+}
+
+#[test]
+fn wave4_scratch_views_and_reusable_quantize_into_perform_zero_heap_allocations() {
+    let rows = 19_usize;
+    let cols = 512_usize;
+    let blocks_32 = cols / 32;
+    let blocks_256 = cols / 256;
+    let (w_q4_0, w_q4_k) = build_wave4_q4_weights(rows, cols);
+
+    let shape = [cols, rows];
+    let v_q4_0 = TensorView::from_bytes("q4_0", QuantType::Q4_0, &shape, 0, &w_q4_0).unwrap();
+    let v_q4_k = TensorView::from_bytes("q4_k", QuantType::Q4_K_M, &shape, 0, &w_q4_k).unwrap();
+    let repacked_q4_0 = RepackedWeight::repack(&v_q4_0).expect("repack q4_0");
+    let repacked_q4_k = RepackedWeight::repack(&v_q4_k).expect("repack q4_k");
+
+    let input_a: Vec<f32> = (0..cols)
+        .map(|i| (f32::from(u8::try_from(i % 29).unwrap_or(0)) - 14.0) * 0.125)
+        .collect();
+    let input_b: Vec<f32> = (0..cols)
+        .map(|i| (f32::from(u8::try_from(i % 23).unwrap_or(0)) - 11.0) * 0.0625)
+        .collect();
+
+    // Warm up QuantizedActQ8 reusable container outside measurement window.
+    let mut act_reusable = QuantizedActQ8::new();
+    act_reusable
+        .quantize_into(&input_a, 1, cols)
+        .expect("warmup quantize_into");
+
+    // Pre-allocate scratch arena with conservative budget covering view + Q8_0 + Q8_K.
+    let q8_0_budget = blocks_32 * size_of::<BlockQ8_0>() + 256;
+    let q8_k_budget = blocks_256 * size_of::<BlockQ8K>() + 256;
+    let view_budget = QuantizedActQ8View::scratch_bytes_for_row(cols);
+    let mut scratch =
+        ScratchWorkspace::new(view_budget + q8_0_budget + q8_k_budget).expect("arena");
+
+    // Compute owned reference outputs outside measurement window.
+    let act_b_owned = QuantizedActQ8::quantize_row(&input_b).expect("act_b_owned");
+    let mut ref_q4_0 = vec![0.0_f32; rows];
+    let mut ref_q4_k = vec![0.0_f32; rows];
+    let mut ref_slice = vec![0.0_f32; 7];
+    gemv_repacked(&mut ref_q4_0, &repacked_q4_0, &act_b_owned).unwrap();
+    gemv_repacked(&mut ref_q4_k, &repacked_q4_k, &act_b_owned).unwrap();
+    gemv_repacked_rows(&mut ref_slice, &repacked_q4_k, &act_b_owned, 5..12).unwrap();
+
+    let mut ref_q8_0 = vec![BlockQ8_0::ZERO; blocks_32];
+    let mut ref_q8_k = vec![BlockQ8K::ZERO; blocks_256];
+    quantize_row_q8_0(&input_b, &mut ref_q8_0).unwrap();
+    quantize_row_q8_k(&input_b, &mut ref_q8_k).unwrap();
+
+    let mut out_q4_0 = vec![0.0_f32; rows];
+    let mut out_q4_k = vec![0.0_f32; rows];
+    let mut out_q8_0 = vec![0.0_f32; rows];
+    let mut out_q8_k = vec![0.0_f32; rows];
+    let mut out_slice = vec![0.0_f32; 7];
+
+    // Phase 1: Scoped zero-alloc decode step (`QuantizedActQ8View::quantize_row_in_scope`,
+    // `quantize_row_q8_{0,k}_in_scope`, `gemv_repacked_view_rows`, `RepackedWeight::gemv_view*`,
+    // and repeated `QuantizedActQ8::quantize_into` reuse).
+    let ((), scope_bytes) = measure_alloc_bytes(|| {
+        for iter in 0..4 {
+            let x = if iter % 2 == 0 { &input_a } else { &input_b };
+            act_reusable
+                .quantize_into(x, 1, cols)
+                .expect("reused quantize_into");
+            repacked_q4_0
+                .gemv_view(&mut out_q4_0, &act_reusable.as_view())
+                .unwrap();
+
+            let scope = scratch.scope();
+            let view = QuantizedActQ8View::quantize_row_in_scope(x, &scope).expect("view in scope");
+            gemv_repacked_view(&mut out_q4_0, &repacked_q4_0, &view).unwrap();
+            repacked_q4_k.gemv_view(&mut out_q4_k, &view).unwrap();
+            repacked_q4_k
+                .gemv_view_rows(&mut out_slice, &view, 5..12)
+                .unwrap();
+            gemv_repacked_view_rows(&mut out_slice, &repacked_q4_k, &view, 5..12).unwrap();
+
+            let q8_0 = quantize_row_q8_0_in_scope(x, &scope).expect("q8_0 in scope");
+            let q8_k = quantize_row_q8_k_in_scope(x, &scope).expect("q8_k in scope");
+            gemv_q4_0_q8_0_4x(&mut out_q8_0, &v_q4_0, q8_0).unwrap();
+            gemv_q4_k_q8_k(&mut out_q8_k, &v_q4_k, q8_k).unwrap();
+        }
+    });
+    assert_eq!(
+        scope_bytes, 0,
+        "expected 0 heap allocations across QuantizedActQ8::quantize_into and ScratchScope decode"
+    );
+    assert_eq!(out_q4_0, ref_q4_0);
+    assert_eq!(out_q4_k, ref_q4_k);
+    assert_eq!(out_slice, ref_slice);
+
+    // Phase 2: Sequential ScratchWorkspace `in_scratch` helpers + `reset()` loop (`input_b` last).
+    let ((), scratch_bytes) = measure_alloc_bytes(|| {
+        for x in [&input_a, &input_b] {
+            scratch.reset();
+            let view = QuantizedActQ8View::quantize_row_in_scratch(x, &mut scratch)
+                .expect("view in scratch");
+            repacked_q4_0.gemv_view(&mut out_q4_0, &view).unwrap();
+            repacked_q4_k.gemv_view(&mut out_q4_k, &view).unwrap();
+            gemv_repacked_view_rows(&mut out_slice, &repacked_q4_k, &view, 5..12).unwrap();
+
+            let q8_0 = quantize_row_q8_0_in_scratch(x, &mut scratch).expect("q8_0 in scratch");
+            assert_eq!(q8_0.len(), blocks_32);
+            let q8_k = quantize_row_q8_k_in_scratch(x, &mut scratch).expect("q8_k in scratch");
+            assert_eq!(q8_k.len(), blocks_256);
+        }
+    });
+    assert_eq!(
+        scratch_bytes, 0,
+        "expected 0 heap allocations across ScratchWorkspace::reset() decode iterations"
+    );
+
+    assert_eq!(out_q4_0, ref_q4_0);
+    assert_eq!(out_q4_k, ref_q4_k);
+    assert_eq!(out_slice, ref_slice);
+
+    scratch.reset();
+    let final_q8_0 = quantize_row_q8_0_in_scratch(&input_b, &mut scratch).unwrap();
+    assert_eq!(final_q8_0, &ref_q8_0);
+    let final_q8_k = quantize_row_q8_k_in_scratch(&input_b, &mut scratch).unwrap();
+    assert_eq!(final_q8_k, &ref_q8_k);
 }

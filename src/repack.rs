@@ -19,7 +19,9 @@
 
 use std::ops::Range;
 
-use jero_core::{K3Error, QuantType, TensorView};
+use jero_core::{
+    K3Error, QuantType, SCRATCH_ALIGNMENT, ScratchScope, ScratchWorkspace, TensorView,
+};
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::dot_product_f32_rvv;
@@ -475,6 +477,12 @@ pub struct QuantizedActQ8 {
     super_scales_256: Vec<f32>,
     /// Layout: `[row_m: 0..m][aligned_blk: 0..k_padded / 32]` (`32` `f32`s per `Aligned128`).
     f32_rows: Vec<Aligned128>,
+    /// Reusable per-row `Q8` staging buffer (`quantize_into`) to keep steady-state calls allocation-free.
+    row_q8: Vec<i8>,
+    /// Reusable per-row block scale staging buffer (`quantize_into`).
+    row_scales: Vec<f32>,
+    /// Reusable per-row block sum staging buffer (`quantize_into`).
+    row_sums: Vec<f32>,
 }
 
 impl Default for QuantizedActQ8 {
@@ -500,6 +508,9 @@ impl QuantizedActQ8 {
             x_sums_16: Vec::new(),
             super_scales_256: Vec::new(),
             f32_rows: Vec::new(),
+            row_q8: Vec::new(),
+            row_scales: Vec::new(),
+            row_sums: Vec::new(),
         }
     }
 
@@ -579,13 +590,21 @@ impl QuantizedActQ8 {
         self.f32_rows.clear();
         self.f32_rows.resize(m * k_blocks32, Aligned128::zeroed());
 
-        let mut row_q8 = vec![0_i8; k_padded];
-        let mut row_scales = vec![0.0_f32; k_blocks32];
-        let mut row_sums = vec![0.0_f32; k_blocks32];
+        self.row_q8.clear();
+        self.row_q8.resize(k_padded, 0_i8);
+        self.row_scales.clear();
+        self.row_scales.resize(k_blocks32, 0.0_f32);
+        self.row_sums.clear();
+        self.row_sums.resize(k_blocks32, 0.0_f32);
 
         for row in 0..m {
             let src_row = &act[row * k..(row + 1) * k];
-            quantize_row_f32_to_q8_32(src_row, &mut row_q8, &mut row_scales, &mut row_sums)?;
+            quantize_row_f32_to_q8_32(
+                src_row,
+                &mut self.row_q8,
+                &mut self.row_scales,
+                &mut self.row_sums,
+            )?;
 
             // Populate sanitized 128B-aligned f32 row for DenseF32 / DenseHalf kernels
             let dst_f32_blocks = &mut self.f32_rows[row * k_blocks32..(row + 1) * k_blocks32];
@@ -599,9 +618,9 @@ impl QuantizedActQ8 {
 
             for b32 in 0..k_blocks32 {
                 let meta_idx = (mt * k_blocks32 + b32) * TILE_M + r_in_tile;
-                let sc = row_scales[b32];
+                let sc = self.row_scales[b32];
                 self.x_scales[meta_idx] = sc;
-                self.x_sums[meta_idx] = row_sums[b32];
+                self.x_sums[meta_idx] = self.row_sums[b32];
 
                 let sb_idx = (b32 * ACT_Q8_GROUP_ELEMENTS) / ACT_Q8_SUPER_BLOCK_ELEMENTS;
                 if sb_idx < sb256_per_row {
@@ -621,7 +640,7 @@ impl QuantizedActQ8 {
                 let dst_off = r_in_tile * TILE_K;
                 let src_off = ch * TILE_K;
                 tile_bytes[dst_off..dst_off + TILE_K]
-                    .copy_from_slice(&row_q8[src_off..src_off + TILE_K]);
+                    .copy_from_slice(&self.row_q8[src_off..src_off + TILE_K]);
                 self.x_sums_16[(mt * k_chunks + ch) * TILE_M + r_in_tile] =
                     row_f32[src_off..src_off + TILE_K].iter().copied().sum();
             }
@@ -684,10 +703,389 @@ impl QuantizedActQ8 {
         &self.super_scales_256
     }
 
+    /// Borrows this quantized batch as a zero-copy [`QuantizedActQ8View`].
+    #[must_use]
+    pub fn as_view(&self) -> QuantizedActQ8View<'_> {
+        QuantizedActQ8View {
+            m: self.m,
+            k: self.k,
+            k_padded: self.k_padded,
+            m_tiles: self.m_tiles,
+            k_chunks: self.k_chunks,
+            k_blocks32: self.k_blocks32,
+            tiles_i8: Aligned128::slice_as_i8(&self.tiles),
+            x_scales: &self.x_scales,
+            x_sums: &self.x_sums,
+            x_sums_16: &self.x_sums_16,
+            super_scales_256: &self.super_scales_256,
+            f32_rows: Aligned128::slice_as_f32(&self.f32_rows),
+        }
+    }
+}
+
+#[inline]
+const fn align_up_128(bytes: usize) -> usize {
+    let rem = bytes % SCRATCH_ALIGNMENT;
+    if rem == 0 {
+        bytes
+    } else {
+        bytes.saturating_add(SCRATCH_ALIGNMENT - rem)
+    }
+}
+
+#[inline]
+fn aligned_bytes_as_slice_mut<T: Copy>(bytes: &mut [u8], len: usize) -> &mut [T] {
+    assert!(bytes.len() >= len * size_of::<T>());
+    assert_eq!(bytes.as_ptr() as usize % SCRATCH_ALIGNMENT, 0);
+    // SAFETY: `bytes` begins on a `128`-byte (`>= align_of::<T>()`) boundary, covers at least
+    // `len * size_of::<T>()` exclusively borrowed bytes, and is immediately zero-filled below.
+    unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<T>(), len) }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "writes quantized M=1 row slices directly into caller-provided scratch sub-slices"
+)]
+fn populate_single_row_slices(
+    src_row: &[f32],
+    k: usize,
+    k_chunks: usize,
+    k_blocks32: usize,
+    sb256_per_row: usize,
+    tiles_i8: &mut [i8],
+    x_scales: &mut [f32],
+    x_sums: &mut [f32],
+    x_sums_16: &mut [f32],
+    super_scales_256: &mut [f32],
+    f32_row_dst: &mut [f32],
+) {
+    let _ = k_chunks;
+    let mut block_f32 = [0.0_f32; ACT_Q8_GROUP_ELEMENTS];
+    let mut block_q8 = [0_i8; ACT_Q8_GROUP_ELEMENTS];
+    for b32 in 0..k_blocks32 {
+        let start = b32 * ACT_Q8_GROUP_ELEMENTS;
+        let end = (start + ACT_Q8_GROUP_ELEMENTS).min(k);
+        let valid = end - start;
+        block_f32.fill(0.0_f32);
+        for (idx, &val) in src_row[start..end].iter().enumerate() {
+            let clean = if val.is_finite() { val } else { 0.0_f32 };
+            block_f32[idx] = clean;
+            f32_row_dst[start + idx] = clean;
+        }
+        let _ = valid;
+
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        let (sc, sum32) = quantize_block32_rvv(&block_f32, &mut block_q8);
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
+        let (sc, sum32) = quantize_block32_scalar(&block_f32, &mut block_q8);
+
+        let meta_idx = b32 * TILE_M;
+        x_scales[meta_idx] = sc;
+        x_sums[meta_idx] = sum32;
+
+        let sb_idx = start / ACT_Q8_SUPER_BLOCK_ELEMENTS;
+        if sb_idx < sb256_per_row && sc > super_scales_256[sb_idx] {
+            super_scales_256[sb_idx] = sc;
+        }
+
+        for half in 0..2 {
+            let ch = b32 * 2 + half;
+            let src_half = &block_q8[half * TILE_K..(half + 1) * TILE_K];
+            tiles_i8[ch * TILE_BYTES..ch * TILE_BYTES + TILE_K].copy_from_slice(src_half);
+            x_sums_16[ch * TILE_M] = block_f32[half * TILE_K..(half + 1) * TILE_K]
+                .iter()
+                .copied()
+                .sum();
+        }
+    }
+}
+
+/// Arena-backed borrowed view of dynamically quantized activations compatible with [`RepackedWeight`],
+/// supporting single-token `M = 1` GEMV with zero heap allocations via [`ScratchWorkspace`] or
+/// [`ScratchScope`].
+#[derive(Debug, Clone, Copy)]
+pub struct QuantizedActQ8View<'a> {
+    m: usize,
+    k: usize,
+    k_padded: usize,
+    m_tiles: usize,
+    k_chunks: usize,
+    k_blocks32: usize,
+    tiles_i8: &'a [i8],
+    x_scales: &'a [f32],
+    x_sums: &'a [f32],
+    x_sums_16: &'a [f32],
+    super_scales_256: &'a [f32],
+    f32_rows: &'a [f32],
+}
+
+impl<'a> QuantizedActQ8View<'a> {
+    /// Returns a conservative byte budget for quantizing a single `[1, k]` activation row into a
+    /// [`ScratchWorkspace`] or [`ScratchScope`], accounting for `128`-byte alignment padding across
+    /// all `6` sub-slices.
+    #[must_use]
+    pub const fn scratch_bytes_for_row(k: usize) -> usize {
+        if k == 0 {
+            return 0;
+        }
+        let rem = k % ACT_Q8_GROUP_ELEMENTS;
+        let k_padded = if rem == 0 {
+            k
+        } else {
+            k.saturating_add(ACT_Q8_GROUP_ELEMENTS - rem)
+        };
+        let k_chunks = k_padded / TILE_K;
+        let k_blocks32 = k_padded / ACT_Q8_GROUP_ELEMENTS;
+        let sb256_per_row = k.div_ceil(ACT_Q8_SUPER_BLOCK_ELEMENTS);
+
+        let s0 = align_up_128(k_chunks.saturating_mul(TILE_BYTES));
+        let s1 = align_up_128(
+            k_blocks32
+                .saturating_mul(TILE_M)
+                .saturating_mul(size_of::<f32>()),
+        );
+        let s2 = s1;
+        let s3 = align_up_128(
+            k_chunks
+                .saturating_mul(TILE_M)
+                .saturating_mul(size_of::<f32>()),
+        );
+        let s4 = align_up_128(sb256_per_row.saturating_mul(size_of::<f32>()));
+        let s5 = align_up_128(k_padded.saturating_mul(size_of::<f32>()));
+
+        SCRATCH_ALIGNMENT
+            .saturating_add(s0)
+            .saturating_add(s1)
+            .saturating_add(s2)
+            .saturating_add(s3)
+            .saturating_add(s4)
+            .saturating_add(s5)
+    }
+
+    /// Quantizes a `[1, act.len()]` `f32` vector directly into `scratch` with zero heap allocations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if `act` is empty or exceeds `scratch` capacity.
+    pub fn quantize_row_in_scratch(
+        act: &[f32],
+        scratch: &'a mut ScratchWorkspace,
+    ) -> Result<Self, K3Error> {
+        let k = act.len();
+        if k == 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "QuantizedActQ8View".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "activation length must be non-empty".to_owned(),
+            });
+        }
+        let k_padded = k.next_multiple_of(ACT_Q8_GROUP_ELEMENTS);
+        let k_chunks = k_padded / TILE_K;
+        let k_blocks32 = k_padded / ACT_Q8_GROUP_ELEMENTS;
+        let sb256_per_row = k.div_ceil(ACT_Q8_SUPER_BLOCK_ELEMENTS);
+
+        let tiles_len = k_chunks * TILE_BYTES;
+        let meta_len = k_blocks32 * TILE_M;
+        let sums16_len = k_chunks * TILE_M;
+
+        let s0 = align_up_128(tiles_len);
+        let s1 = align_up_128(meta_len * size_of::<f32>());
+        let s2 = s1;
+        let s3 = align_up_128(sums16_len * size_of::<f32>());
+        let s4 = align_up_128(sb256_per_row * size_of::<f32>());
+        let s5 = k_padded * size_of::<f32>();
+        let total = s0
+            .checked_add(s1)
+            .and_then(|v| v.checked_add(s2))
+            .and_then(|v| v.checked_add(s3))
+            .and_then(|v| v.checked_add(s4))
+            .and_then(|v| v.checked_add(s5))
+            .ok_or_else(|| K3Error::TensorBoundsError {
+                tensor_name: "QuantizedActQ8View".to_owned(),
+                offset: 0,
+                byte_len: usize::MAX,
+                buffer_len: scratch.remaining_bytes(),
+                reason: "QuantizedActQ8View scratch byte requirement overflow".to_owned(),
+            })?;
+
+        let raw = scratch.alloc_u8(total)?;
+        let (b0, rest) = raw.split_at_mut(s0);
+        let (b1, rest) = rest.split_at_mut(s1);
+        let (b2, rest) = rest.split_at_mut(s2);
+        let (b3, rest) = rest.split_at_mut(s3);
+        let (b4, b5) = rest.split_at_mut(s4);
+
+        let tiles_i8 = aligned_bytes_as_slice_mut::<i8>(b0, tiles_len);
+        tiles_i8.fill(0);
+        let x_scales = aligned_bytes_as_slice_mut::<f32>(b1, meta_len);
+        x_scales.fill(0.0);
+        let x_sums = aligned_bytes_as_slice_mut::<f32>(b2, meta_len);
+        x_sums.fill(0.0);
+        let x_sums_16 = aligned_bytes_as_slice_mut::<f32>(b3, sums16_len);
+        x_sums_16.fill(0.0);
+        let super_scales_256 = aligned_bytes_as_slice_mut::<f32>(b4, sb256_per_row);
+        super_scales_256.fill(0.0);
+        let f32_rows = aligned_bytes_as_slice_mut::<f32>(b5, k_padded);
+        f32_rows.fill(0.0);
+
+        populate_single_row_slices(
+            act,
+            k,
+            k_chunks,
+            k_blocks32,
+            sb256_per_row,
+            tiles_i8,
+            x_scales,
+            x_sums,
+            x_sums_16,
+            super_scales_256,
+            f32_rows,
+        );
+
+        Ok(Self {
+            m: 1,
+            k,
+            k_padded,
+            m_tiles: 1,
+            k_chunks,
+            k_blocks32,
+            tiles_i8,
+            x_scales,
+            x_sums,
+            x_sums_16,
+            super_scales_256,
+            f32_rows,
+        })
+    }
+
+    /// Quantizes a `[1, act.len()]` `f32` vector directly into an interior-bump [`ScratchScope`]
+    /// with zero heap allocations and zero unsafe slice casting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if `act` is empty or exceeds `scope` capacity.
+    pub fn quantize_row_in_scope(
+        act: &[f32],
+        scope: &'a ScratchScope<'_>,
+    ) -> Result<Self, K3Error> {
+        let k = act.len();
+        if k == 0 {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "QuantizedActQ8View".to_owned(),
+                offset: 0,
+                byte_len: 0,
+                buffer_len: 0,
+                reason: "activation length must be non-empty".to_owned(),
+            });
+        }
+        let k_padded = k.next_multiple_of(ACT_Q8_GROUP_ELEMENTS);
+        let k_chunks = k_padded / TILE_K;
+        let k_blocks32 = k_padded / ACT_Q8_GROUP_ELEMENTS;
+        let sb256_per_row = k.div_ceil(ACT_Q8_SUPER_BLOCK_ELEMENTS);
+
+        let tiles_i8 = scope.alloc_i8_zeroed(k_chunks * TILE_BYTES)?;
+        let x_scales = scope.alloc_f32_zeroed(k_blocks32 * TILE_M)?;
+        let x_sums = scope.alloc_f32_zeroed(k_blocks32 * TILE_M)?;
+        let x_sums_16 = scope.alloc_f32_zeroed(k_chunks * TILE_M)?;
+        let super_scales_256 = scope.alloc_f32_zeroed(sb256_per_row)?;
+        let f32_rows = scope.alloc_f32_zeroed(k_padded)?;
+
+        populate_single_row_slices(
+            act,
+            k,
+            k_chunks,
+            k_blocks32,
+            sb256_per_row,
+            tiles_i8,
+            x_scales,
+            x_sums,
+            x_sums_16,
+            super_scales_256,
+            f32_rows,
+        );
+
+        Ok(Self {
+            m: 1,
+            k,
+            k_padded,
+            m_tiles: 1,
+            k_chunks,
+            k_blocks32,
+            tiles_i8,
+            x_scales,
+            x_sums,
+            x_sums_16,
+            super_scales_256,
+            f32_rows,
+        })
+    }
+
+    /// Number of token rows `M` in the quantized activation batch.
+    #[must_use]
+    pub const fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Logical inner dimension `K` (`cols`).
+    #[must_use]
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
+    /// `32`-element padded inner dimension `K`.
+    #[must_use]
+    pub const fn k_padded(&self) -> usize {
+        self.k_padded
+    }
+
+    /// Number of `8`-row `M` tiles (`m.div_ceil(8)`).
+    #[must_use]
+    pub const fn m_tiles(&self) -> usize {
+        self.m_tiles
+    }
+
+    /// Number of `16`-element `K` chunks (`k_padded / 16`).
+    #[must_use]
+    pub const fn k_chunks(&self) -> usize {
+        self.k_chunks
+    }
+
+    /// Packed `8 x 16` `i8` activation tiles laid out as `[m_tile][k_chunk][128]`.
+    #[must_use]
+    pub const fn tiles_i8(&self) -> &[i8] {
+        self.tiles_i8
+    }
+
+    /// Per-`32`-element block activation scales (`absmax / 127.0`) in `[m_tile][b32][8]` layout.
+    #[must_use]
+    pub const fn x_scales(&self) -> &[f32] {
+        self.x_scales
+    }
+
+    /// Exact `f32` per-`32`-element block sums in `[m_tile][b32][8]` layout.
+    #[must_use]
+    pub const fn x_sums(&self) -> &[f32] {
+        self.x_sums
+    }
+
+    /// Exact `f32` per-`16`-element chunk sums in `[m_tile][ch][8]` layout.
+    #[must_use]
+    pub const fn x_sums_16(&self) -> &[f32] {
+        self.x_sums_16
+    }
+
+    /// Per-`256`-element super-block activation scales (`[m][k.div_ceil(256)]`).
+    #[must_use]
+    pub const fn super_scales(&self) -> &[f32] {
+        self.super_scales_256
+    }
+
     #[inline]
     fn f32_row(&self, row: usize) -> &[f32] {
-        let blocks = &self.f32_rows[row * self.k_blocks32..(row + 1) * self.k_blocks32];
-        &Aligned128::slice_as_f32(blocks)[..self.k]
+        let stride = self.k_blocks32 * F32_PER_ALIGNED128;
+        &self.f32_rows[row * stride..row * stride + self.k]
     }
 }
 
@@ -2222,6 +2620,30 @@ impl RepackedWeight {
         gemv_repacked_rows(out, self, act, row_range)
     }
 
+    /// Single-token GEMV (`[1, K] x [N, K]^T -> [N]`) over an arena-backed [`QuantizedActQ8View`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on dimension mismatch.
+    pub fn gemv_view(&self, out: &mut [f32], act: &QuantizedActQ8View<'_>) -> Result<(), K3Error> {
+        gemv_repacked_view(out, self, act)
+    }
+
+    /// Row-sliced single-token GEMV (`row_range` within `0..self.rows()`) over an arena-backed
+    /// [`QuantizedActQ8View`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on dimension or range mismatch.
+    pub fn gemv_view_rows(
+        &self,
+        out: &mut [f32],
+        act: &QuantizedActQ8View<'_>,
+        row_range: Range<usize>,
+    ) -> Result<(), K3Error> {
+        gemv_repacked_view_rows(out, self, act, row_range)
+    }
+
     /// Batched multi-token GEMM (`[M, K] x [N, K]^T -> [M, N]`) over pre-quantized [`QuantizedActQ8`].
     ///
     /// # Errors
@@ -2296,7 +2718,7 @@ fn eval_half_row_dot(
 fn execute_gemm_repacked_rows(
     out: &mut [f32],
     weights: &RepackedWeight,
-    act: &QuantizedActQ8,
+    act: &QuantizedActQ8View<'_>,
     row_range: Range<usize>,
     vlen_sim_bits: Option<usize>,
 ) -> Result<(), K3Error> {
@@ -2402,10 +2824,10 @@ fn execute_gemm_repacked_rows(
             #[cfg(all(target_arch = "riscv64", not(miri)))]
             let use_hw_ime = vlen_sim_bits.is_none() && has_ime();
 
-            let a_tiles = act.tiles();
+            let a_tiles = act.tiles_i8();
             let x_scales = act.x_scales();
             let x_sums = act.x_sums();
-            let x_sums_16 = &act.x_sums_16;
+            let x_sums_16 = act.x_sums_16();
             let k_blocks32 = act.k_blocks32;
 
             let first_nt = row_range.start / TILE_N;
@@ -2425,7 +2847,8 @@ fn execute_gemm_repacked_rows(
 
                 for mt in 0..act.m_tiles() {
                     let active_m = (m - mt * TILE_M).min(TILE_M);
-                    let a_row_tiles = &a_tiles[mt * *k_chunks..(mt + 1) * *k_chunks];
+                    let a_row_tiles =
+                        &a_tiles[mt * *k_chunks * TILE_BYTES..(mt + 1) * *k_chunks * TILE_BYTES];
                     let x_scales_tile = &x_scales[mt * k_blocks32 * TILE_M..];
                     let x_sums_tile = w_mins_tile.map(|_| {
                         if *chunks_per_scale == 2 {
@@ -2441,7 +2864,7 @@ fn execute_gemm_repacked_rows(
                         for sg in 0..*scale_groups {
                             let ch_start = sg * *chunks_per_scale;
                             let ch_end = ch_start + *chunks_per_scale;
-                            let a_sub = Aligned128::slice_as_i8(&a_row_tiles[ch_start..ch_end]);
+                            let a_sub = &a_row_tiles[ch_start * TILE_BYTES..ch_end * TILE_BYTES];
                             let b_sub = Aligned128::slice_as_i8(&b_row_tiles[ch_start..ch_end]);
                             tile_dot_vla_sim(
                                 a_sub,
@@ -2467,7 +2890,7 @@ fn execute_gemm_repacked_rows(
                     } else {
                         #[cfg(all(target_arch = "riscv64", not(miri)))]
                         if m <= 2 {
-                            let a_i8 = Aligned128::slice_as_i8(a_row_tiles);
+                            let a_i8 = a_row_tiles;
                             let b_i8 = Aligned128::slice_as_i8(b_row_tiles);
                             let p_x_sums_base =
                                 x_sums_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
@@ -2499,7 +2922,7 @@ fn execute_gemm_repacked_rows(
                                 }
                             }
                         } else if use_hw_ime {
-                            let a_i8 = Aligned128::slice_as_i8(a_row_tiles);
+                            let a_i8 = a_row_tiles;
                             let b_i8 = Aligned128::slice_as_i8(b_row_tiles);
                             let p_x_sums = x_sums_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
                             let p_w_mins = w_mins_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
@@ -2520,7 +2943,7 @@ fn execute_gemm_repacked_rows(
                                 );
                             }
                         } else {
-                            let a_i8 = Aligned128::slice_as_i8(a_row_tiles);
+                            let a_i8 = a_row_tiles;
                             let b_i8 = Aligned128::slice_as_i8(b_row_tiles);
                             let p_x_sums_base =
                                 x_sums_tile.map_or(core::ptr::null(), <[f32]>::as_ptr);
@@ -2576,7 +2999,8 @@ fn execute_gemm_repacked_rows(
                             for sg in 0..*scale_groups {
                                 let ch_start = sg * *chunks_per_scale;
                                 let ch_end = ch_start + *chunks_per_scale;
-                                let a_sub = Aligned128::slice_as_i8(&a_row_tiles[ch_start..ch_end]);
+                                let a_sub =
+                                    &a_row_tiles[ch_start * TILE_BYTES..ch_end * TILE_BYTES];
                                 let b_sub = Aligned128::slice_as_i8(&b_row_tiles[ch_start..ch_end]);
                                 tile_dot_scalar_rows(
                                     a_sub,
@@ -3593,6 +4017,37 @@ pub fn gemv_repacked_rows(
     act: &QuantizedActQ8,
     row_range: Range<usize>,
 ) -> Result<(), K3Error> {
+    gemv_repacked_view_rows(out, weights, &act.as_view(), row_range)
+}
+
+/// Computes single-token GEMV (`[1, K] x [N, K]^T -> [N]`) over repacked weights and an
+/// arena-backed [`QuantizedActQ8View`] (`act.m() == 1`).
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `act.m() != 1`, `act.k() != weights.cols()`, or
+/// `out.len() != weights.rows()`.
+pub fn gemv_repacked_view(
+    out: &mut [f32],
+    weights: &RepackedWeight,
+    act: &QuantizedActQ8View<'_>,
+) -> Result<(), K3Error> {
+    gemv_repacked_view_rows(out, weights, act, 0..weights.rows())
+}
+
+/// Computes row-sliced single-token GEMV (`row_range` within `0..weights.rows()`) over an
+/// arena-backed [`QuantizedActQ8View`] with zero heap allocations.
+///
+/// # Errors
+///
+/// Returns [`K3Error::TensorBoundsError`] if `act.m() != 1`, `row_range` is out of bounds, or
+/// dimensions mismatch.
+pub fn gemv_repacked_view_rows(
+    out: &mut [f32],
+    weights: &RepackedWeight,
+    act: &QuantizedActQ8View<'_>,
+    row_range: Range<usize>,
+) -> Result<(), K3Error> {
     if act.m() != 1 {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "gemv_repacked".to_owned(),
@@ -3635,7 +4090,7 @@ pub fn gemm_repacked_rows(
     act: &QuantizedActQ8,
     row_range: Range<usize>,
 ) -> Result<(), K3Error> {
-    execute_gemm_repacked_rows(out, weights, act, row_range, None)
+    execute_gemm_repacked_rows(out, weights, &act.as_view(), row_range, None)
 }
 
 /// Convenience single-token GEMV accepting a raw `&[f32]` activation slice (`[K]`).
@@ -3721,7 +4176,13 @@ pub fn gemm_repacked_vla_sim(
     act: &QuantizedActQ8,
     vlen_bits: usize,
 ) -> Result<(), K3Error> {
-    execute_gemm_repacked_rows(out, weights, act, 0..weights.rows(), Some(vlen_bits))
+    execute_gemm_repacked_rows(
+        out,
+        weights,
+        &act.as_view(),
+        0..weights.rows(),
+        Some(vlen_bits),
+    )
 }
 
 /// Compact metadata storage backing [`PackedNibbleMatrix`] (`1.00x` raw GGUF footprint when
@@ -5592,5 +6053,91 @@ mod tests {
             par.dequantize_row(r, &mut row_par).unwrap();
             assert_eq!(row_seq, row_par);
         }
+    }
+
+    #[test]
+    fn quantized_act_q8_view_scratch_and_scope_match_owned_and_repack_gemv() {
+        const fn assert_view_traits<T: Copy + Clone + std::fmt::Debug + Send + Sync>() {}
+        assert_view_traits::<QuantizedActQ8View<'_>>();
+
+        assert_eq!(QuantizedActQ8View::scratch_bytes_for_row(0), 0);
+        let cols = 40_usize; // tests tail padding beyond 32
+        let rows = 5_usize;
+        let mut x = (0..cols)
+            .map(|i| (f32::from(u8::try_from(i % 13).expect("mod 13 fits u8")) - 6.0) * 0.25)
+            .collect::<Vec<_>>();
+        x[3] = f32::NAN;
+        x[37] = f32::INFINITY;
+
+        let owned = QuantizedActQ8::quantize_row(&x).expect("owned quantize");
+        let owned_view = owned.as_view();
+
+        let mut ws = ScratchWorkspace::new(QuantizedActQ8View::scratch_bytes_for_row(cols) + 64)
+            .expect("workspace");
+        let _pad = ws.alloc_f32(1).expect("force unaligned starting cursor");
+        let scope = ws.scope();
+        let scoped_view = QuantizedActQ8View::quantize_row_in_scope(&x, &scope).expect("in scope");
+        assert_eq!(scoped_view.m(), owned_view.m());
+        assert_eq!(scoped_view.k(), owned_view.k());
+        assert_eq!(scoped_view.k_padded(), owned_view.k_padded());
+        assert_eq!(scoped_view.m_tiles(), owned_view.m_tiles());
+        assert_eq!(scoped_view.k_chunks(), owned_view.k_chunks());
+        assert_eq!(scoped_view.tiles_i8(), owned_view.tiles_i8());
+        assert_eq!(scoped_view.x_scales(), owned_view.x_scales());
+        assert_eq!(scoped_view.x_sums(), owned_view.x_sums());
+        assert_eq!(scoped_view.x_sums_16(), owned_view.x_sums_16());
+        assert_eq!(scoped_view.super_scales(), owned_view.super_scales());
+        assert_eq!(scoped_view.f32_row(0), owned_view.f32_row(0));
+        drop(scope);
+
+        ws.reset();
+        let scratch_view =
+            QuantizedActQ8View::quantize_row_in_scratch(&x, &mut ws).expect("in scratch");
+        assert_eq!(scratch_view.tiles_i8(), owned_view.tiles_i8());
+        assert_eq!(scratch_view.x_scales(), owned_view.x_scales());
+        assert_eq!(scratch_view.x_sums(), owned_view.x_sums());
+        assert_eq!(scratch_view.x_sums_16(), owned_view.x_sums_16());
+        assert_eq!(scratch_view.super_scales(), owned_view.super_scales());
+
+        // Compact RepackedWeight GEMV parity across F32 & F16 repacked storage.
+        let mut f32_w = Vec::with_capacity(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                f32_w.push(
+                    f32::from(u8::try_from((r * 7 + c * 3) % 11).expect("mod 11 fits u8")) * 0.125
+                        - 0.5,
+                );
+            }
+        }
+        let mut w_bytes = Vec::with_capacity(rows * cols * 4);
+        for &v in &f32_w {
+            w_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let shape = [cols, rows];
+        let tv = TensorView::from_bytes("dense", QuantType::F32, &shape, 0, &w_bytes).unwrap();
+        let repacked = RepackedWeight::repack(&tv).expect("repack dense");
+        let mut out_owned = vec![0.0_f32; rows];
+        let mut out_view = vec![0.0_f32; rows];
+        let mut out_slice = vec![0.0_f32; 2];
+        repacked.gemv(&mut out_owned, &owned).expect("owned gemv");
+        repacked
+            .gemv_view(&mut out_view, &scratch_view)
+            .expect("view gemv");
+        repacked
+            .gemv_view_rows(&mut out_slice, &scratch_view, 1..3)
+            .expect("view gemv rows");
+        assert_eq!(out_view, out_owned);
+        assert_eq!(out_slice, out_owned[1..3]);
+
+        // QuantizedActQ8::quantize_into reuse across calls maintains identical output.
+        let mut reused = QuantizedActQ8::new();
+        reused
+            .quantize_into(&x, 1, cols)
+            .expect("first quantize_into");
+        reused
+            .quantize_into(&x, 1, cols)
+            .expect("second quantize_into");
+        assert_eq!(reused.as_view().tiles_i8(), owned_view.tiles_i8());
+        assert_eq!(reused.as_view().x_scales(), owned_view.x_scales());
     }
 }
