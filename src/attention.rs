@@ -5,6 +5,7 @@
 //! with numerically stable softmax and token-interleaved KV cache indexing.
 
 use jero_core::K3Error;
+use std::ops::Range;
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 use crate::dot_product_f32_rvv;
@@ -83,7 +84,82 @@ pub(crate) fn axpy_f32(out: &mut [f32], x: &[f32], alpha: f32) {
     }
 }
 
+/// Attention masking, positional offset, and score scaling configuration for multi-token GQA prefill (`#92`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttentionMaskConfig {
+    /// Absolute sequence position of token `m = 0` in the current query batch.
+    pub start_pos: usize,
+    /// Optional local sliding-window span (`kv_pos + window >= query_pos + 1`).
+    pub sliding_window: Option<usize>,
+    /// Optional logit softcap (`cap * (score / cap).tanh()`).
+    pub logit_softcap: Option<f32>,
+    /// Dot-product scale factor (typically `1.0 / sqrt(head_dim)`).
+    pub scale: f32,
+}
+
+impl AttentionMaskConfig {
+    /// Creates a standard causal attention configuration starting at `start_pos` with `scale`.
+    #[must_use]
+    pub const fn causal(start_pos: usize, scale: f32) -> Self {
+        Self {
+            start_pos,
+            sliding_window: None,
+            logit_softcap: None,
+            scale,
+        }
+    }
+
+    /// Attaches a local sliding window bound (`None` disables windowing).
+    #[must_use]
+    pub const fn with_sliding_window(mut self, sliding_window: Option<usize>) -> Self {
+        self.sliding_window = sliding_window;
+        self
+    }
+
+    /// Attaches a finite positive logit soft-capping bound (`None` disables softcapping).
+    #[must_use]
+    pub const fn with_logit_softcap(mut self, logit_softcap: Option<f32>) -> Self {
+        self.logit_softcap = logit_softcap;
+        self
+    }
+}
+
+/// Balances KV heads across `worker_count` parallel workers for contention-free GQA prefill (`#93`).
+///
+/// Returns `Some((kv_head_range, q_head_range))` for `worker_idx` when that worker has non-empty
+/// work, or `None` if dimensions are invalid or `worker_idx >= n_heads_kv`.
+#[must_use]
+pub fn gqa_kv_head_partition(
+    n_heads_kv: usize,
+    n_heads_q: usize,
+    worker_idx: usize,
+    worker_count: usize,
+) -> Option<(Range<usize>, Range<usize>)> {
+    if worker_count == 0
+        || worker_idx >= worker_count
+        || n_heads_kv == 0
+        || n_heads_q == 0
+        || n_heads_q % n_heads_kv != 0
+    {
+        return None;
+    }
+    let base = n_heads_kv / worker_count;
+    let rem = n_heads_kv % worker_count;
+    let start_kv = worker_idx * base + worker_idx.min(rem);
+    let count_kv = base + usize::from(worker_idx < rem);
+    if count_kv == 0 {
+        return None;
+    }
+    let group_size = n_heads_q / n_heads_kv;
+    let end_kv = start_kv + count_kv;
+    Some((start_kv..end_kv, start_kv * group_size..end_kv * group_size))
+}
+
 /// Computes Grouped-Query Attention (`GQA`) for a single query token across a sequence of cached keys and values.
+///
+/// Uses a stack scratch buffer for `seq_len <= 2048` (zero heap allocations) and delegates to
+/// [`gqa_causal_attention_with_scratch_f32`]; prefer [`gqa_causal_attention_with_scratch_f32`] on
+/// hot inference paths for arbitrary context lengths without allocation.
 ///
 /// # Memory Layout
 ///
@@ -100,10 +176,6 @@ pub(crate) fn axpy_f32(out: &mut [f32], x: &[f32], alpha: f32) {
     clippy::too_many_arguments,
     reason = "attention kernel takes explicit buffer and geometry parameters"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "GQA score calculation and softmax accumulation loop"
-)]
 pub fn gqa_causal_attention_f32(
     out: &mut [f32],
     q: &[f32],
@@ -115,7 +187,61 @@ pub fn gqa_causal_attention_f32(
     seq_len: usize,
     scale: f32,
 ) -> Result<(), K3Error> {
-    if n_heads_q == 0 || n_heads_kv == 0 || head_dim == 0 || seq_len == 0 {
+    if seq_len <= 2048 {
+        let mut stack_scratch = [0.0_f32; 2048];
+        return gqa_causal_attention_with_scratch_f32(
+            out,
+            q,
+            k_cache,
+            v_cache,
+            n_heads_q,
+            n_heads_kv,
+            head_dim,
+            seq_len,
+            scale,
+            &mut stack_scratch[..seq_len],
+        );
+    }
+    let mut heap_scratch = vec![0.0_f32; seq_len];
+    gqa_causal_attention_with_scratch_f32(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        seq_len,
+        scale,
+        &mut heap_scratch,
+    )
+}
+
+/// Zero-allocation single-token Grouped-Query Attention (`GQA`) using a caller-supplied
+/// `scores_scratch` buffer (`len >= seq_len`) (`#92`).
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `n_heads_q % n_heads_kv != 0`, any dimension is zero,
+///   or `scale` is non-finite.
+/// - Returns [`K3Error::TensorBoundsError`] if tensor or scratch lengths are insufficient or mismatched.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "single-token GQA decode signature plus explicit scratch slice"
+)]
+pub fn gqa_causal_attention_with_scratch_f32(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    seq_len: usize,
+    scale: f32,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    if seq_len == 0 {
         return Err(K3Error::CapabilityMismatch {
             architecture: "gqa".to_owned(),
             reason: format!(
@@ -123,7 +249,144 @@ pub fn gqa_causal_attention_f32(
             ),
         });
     }
+    gqa_causal_attention_prefill_strided_kv_f32(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        1,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        seq_len,
+        n_heads_kv.saturating_mul(head_dim),
+        0..n_heads_kv,
+        AttentionMaskConfig::causal(seq_len - 1, scale),
+        scores_scratch,
+    )
+}
 
+/// Zero-allocation multi-token causal Grouped-Query Attention (`GQA`) prefill across `m` query tokens
+/// using a caller-supplied `scores_scratch` buffer (`#92`).
+///
+/// # Memory Layout
+///
+/// - `q`: `[m, n_heads_q, head_dim]`
+/// - `out`: `[m, n_heads_q, head_dim]`
+/// - `k_cache` / `v_cache`: `[total_seq_len, n_heads_kv, head_dim]`
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] on invalid dimensions, zero sliding window, or non-finite/non-positive
+/// softcap/scale, or [`K3Error::TensorBoundsError`] on tensor or scratch length mismatch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit prefill geometry, mask config, and caller scratch"
+)]
+pub fn gqa_causal_attention_prefill_f32(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    config: AttentionMaskConfig,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    gqa_causal_attention_prefill_strided_kv_f32(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        m,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        total_seq_len,
+        n_heads_kv.saturating_mul(head_dim),
+        0..n_heads_kv,
+        config,
+        scores_scratch,
+    )
+}
+
+/// Multi-token causal GQA prefill restricted to a disjoint KV-head slice (`kv_head_range`), enabling
+/// lock-free `WorkerPool` parallelism over `[0..n_heads_kv]` (`#93`).
+///
+/// - `q` holds all heads (`[m, n_heads_q, head_dim]`, shared read-only).
+/// - `out` holds only the worker's output slice (`[m, kv_head_range.len() * (n_heads_q / n_heads_kv), head_dim]`),
+///   matching `[m, n_heads_q, head_dim]` when `kv_head_range == 0..n_heads_kv`.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] on invalid configuration,
+/// out-of-range KV slice, or buffer bounds mismatch.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit KV-head slice range and caller scratch for lock-free parallel workers"
+)]
+pub fn gqa_causal_attention_prefill_kv_heads_f32(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    kv_head_range: Range<usize>,
+    config: AttentionMaskConfig,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    gqa_causal_attention_prefill_strided_kv_f32(
+        out,
+        q,
+        k_cache,
+        v_cache,
+        m,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        total_seq_len,
+        n_heads_kv.saturating_mul(head_dim),
+        kv_head_range,
+        config,
+        scores_scratch,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "validated prefill geometry parameters"
+)]
+fn validate_prefill_args(
+    out_len: usize,
+    q_len: usize,
+    k_len: usize,
+    v_len: usize,
+    scratch_len: usize,
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    kv_row_stride: usize,
+    kv_head_range: &Range<usize>,
+    config: AttentionMaskConfig,
+) -> Result<usize, K3Error> {
+    if n_heads_q == 0 || n_heads_kv == 0 || head_dim == 0 || m == 0 || total_seq_len == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gqa".to_owned(),
+            reason: format!(
+                "GQA prefill dimensions must be non-zero (m={m}, n_heads_q={n_heads_q}, n_heads_kv={n_heads_kv}, head_dim={head_dim}, total_seq_len={total_seq_len})"
+            ),
+        });
+    }
     if n_heads_q % n_heads_kv != 0 {
         return Err(K3Error::CapabilityMismatch {
             architecture: "gqa".to_owned(),
@@ -132,41 +395,120 @@ pub fn gqa_causal_attention_f32(
             ),
         });
     }
+    if !config.scale.is_finite() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gqa".to_owned(),
+            reason: format!("attention scale must be finite (got {})", config.scale),
+        });
+    }
+    if config.sliding_window == Some(0) {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "gqa".to_owned(),
+            reason: "sliding_window must be >= 1 when set".to_owned(),
+        });
+    }
+    if let Some(cap) = config.logit_softcap {
+        if !cap.is_finite() || cap <= 0.0 {
+            return Err(K3Error::CapabilityMismatch {
+                architecture: "gqa".to_owned(),
+                reason: format!("logit_softcap must be finite and > 0 (got {cap})"),
+            });
+        }
+    }
+    if kv_head_range.start > kv_head_range.end || kv_head_range.end > n_heads_kv {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_kv_head_range".to_owned(),
+            offset: kv_head_range.start,
+            byte_len: kv_head_range.len(),
+            buffer_len: n_heads_kv,
+            reason: format!("kv_head_range {kv_head_range:?} exceeds n_heads_kv={n_heads_kv}"),
+        });
+    }
 
-    let expected_q_len =
-        n_heads_q
-            .checked_mul(head_dim)
-            .ok_or_else(|| K3Error::TensorBoundsError {
-                tensor_name: "gqa_q".to_owned(),
-                offset: 0,
-                byte_len: 0,
-                buffer_len: usize::MAX,
-                reason: "q dimension overflow".to_owned(),
-            })?;
+    let query_end = config
+        .start_pos
+        .checked_add(m)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "gqa_start_pos".to_owned(),
+            offset: config.start_pos,
+            byte_len: m,
+            buffer_len: total_seq_len,
+            reason: "start_pos + m overflow".to_owned(),
+        })?;
+    if query_end > total_seq_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_start_pos".to_owned(),
+            offset: config.start_pos,
+            byte_len: m,
+            buffer_len: total_seq_len,
+            reason: format!("start_pos + m ({query_end}) exceeds total_seq_len ({total_seq_len})"),
+        });
+    }
 
-    if q.len() != expected_q_len {
+    let kv_width = n_heads_kv
+        .checked_mul(head_dim)
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "gqa_kv".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "kv head width overflow".to_owned(),
+        })?;
+    if kv_row_stride < kv_width {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_kv_stride".to_owned(),
+            offset: 0,
+            byte_len: kv_row_stride,
+            buffer_len: kv_width,
+            reason: format!("kv_row_stride ({kv_row_stride}) < n_heads_kv * head_dim ({kv_width})"),
+        });
+    }
+
+    let expected_q_len = m
+        .checked_mul(n_heads_q)
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "gqa_q".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "q dimension overflow".to_owned(),
+        })?;
+    if q_len != expected_q_len {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "gqa_q".to_owned(),
             offset: 0,
-            byte_len: size_of_val(q),
+            byte_len: q_len * size_of::<f32>(),
             buffer_len: expected_q_len * size_of::<f32>(),
-            reason: format!("query length {} != expected {expected_q_len}", q.len()),
+            reason: format!("query length {q_len} != expected {expected_q_len}"),
         });
     }
 
-    if out.len() != expected_q_len {
+    let group_size = n_heads_q / n_heads_kv;
+    let local_q_heads = kv_head_range.len() * group_size;
+    let expected_out_len = m
+        .checked_mul(local_q_heads)
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| K3Error::TensorBoundsError {
+            tensor_name: "gqa_out".to_owned(),
+            offset: 0,
+            byte_len: 0,
+            buffer_len: usize::MAX,
+            reason: "out dimension overflow".to_owned(),
+        })?;
+    if out_len != expected_out_len {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "gqa_out".to_owned(),
             offset: 0,
-            byte_len: size_of_val(out),
-            buffer_len: expected_q_len * size_of::<f32>(),
-            reason: format!("output length {} != expected {expected_q_len}", out.len()),
+            byte_len: out_len * size_of::<f32>(),
+            buffer_len: expected_out_len * size_of::<f32>(),
+            reason: format!("output length {out_len} != expected {expected_out_len}"),
         });
     }
 
-    let expected_kv_len = seq_len
-        .checked_mul(n_heads_kv)
-        .and_then(|v| v.checked_mul(head_dim))
+    let min_kv_len = (total_seq_len - 1)
+        .checked_mul(kv_row_stride)
+        .and_then(|v| v.checked_add(kv_width))
         .ok_or_else(|| K3Error::TensorBoundsError {
             tensor_name: "gqa_kv".to_owned(),
             offset: 0,
@@ -174,86 +516,136 @@ pub fn gqa_causal_attention_f32(
             buffer_len: usize::MAX,
             reason: "kv dimension overflow".to_owned(),
         })?;
-
-    if k_cache.len() < expected_kv_len {
+    if k_len < min_kv_len {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "gqa_k_cache".to_owned(),
             offset: 0,
-            byte_len: size_of_val(k_cache),
-            buffer_len: expected_kv_len * size_of::<f32>(),
-            reason: format!(
-                "k_cache length {} < expected {expected_kv_len}",
-                k_cache.len()
-            ),
+            byte_len: k_len * size_of::<f32>(),
+            buffer_len: min_kv_len * size_of::<f32>(),
+            reason: format!("k_cache length {k_len} < required {min_kv_len}"),
         });
     }
-
-    if v_cache.len() < expected_kv_len {
+    if v_len < min_kv_len {
         return Err(K3Error::TensorBoundsError {
             tensor_name: "gqa_v_cache".to_owned(),
             offset: 0,
-            byte_len: size_of_val(v_cache),
-            buffer_len: expected_kv_len * size_of::<f32>(),
-            reason: format!(
-                "v_cache length {} < expected {expected_kv_len}",
-                v_cache.len()
-            ),
+            byte_len: v_len * size_of::<f32>(),
+            buffer_len: min_kv_len * size_of::<f32>(),
+            reason: format!("v_cache length {v_len} < required {min_kv_len}"),
         });
     }
 
-    let group_size = n_heads_q / n_heads_kv;
-    let mut scores = vec![0.0_f32; seq_len];
+    let min_scratch = config
+        .sliding_window
+        .map_or(query_end, |w| w.min(query_end));
+    if scratch_len < min_scratch {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "gqa_scores_scratch".to_owned(),
+            offset: 0,
+            byte_len: scratch_len * size_of::<f32>(),
+            buffer_len: min_scratch * size_of::<f32>(),
+            reason: format!("scores_scratch length {scratch_len} < required {min_scratch}"),
+        });
+    }
 
-    for h_q in 0..n_heads_q {
-        let h_kv = h_q / group_size;
-        let q_head = &q[h_q * head_dim..(h_q + 1) * head_dim];
+    Ok(group_size)
+}
 
-        // 1. Scaled dot product score across cached tokens
-        let mut max_score = f32::NEG_INFINITY;
-        for (s, score_slot) in scores.iter_mut().enumerate().take(seq_len) {
-            let kv_offset = (s * n_heads_kv + h_kv) * head_dim;
-            let k_slice = &k_cache[kv_offset..kv_offset + head_dim];
-            let raw_dot = dot_f32(q_head, k_slice);
-            let sc = raw_dot * scale;
-            *score_slot = sc;
-            if sc > max_score {
-                max_score = sc;
+/// Strided-KV-cache GQA prefill over a KV-head range (`#93`), supporting KV caches whose token
+/// row stride exceeds `n_heads_kv * head_dim` (padded/paged KV layouts) with KV-head outer grouping.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] or [`K3Error::TensorBoundsError`] when dimensions,
+/// stride, KV-head range, or scratch length are invalid.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "strided KV-cache prefill with KV-head range and caller scratch"
+)]
+pub fn gqa_causal_attention_prefill_strided_kv_f32(
+    out: &mut [f32],
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    m: usize,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    total_seq_len: usize,
+    kv_row_stride: usize,
+    kv_head_range: Range<usize>,
+    config: AttentionMaskConfig,
+    scores_scratch: &mut [f32],
+) -> Result<(), K3Error> {
+    let group_size = validate_prefill_args(
+        out.len(),
+        q.len(),
+        k_cache.len(),
+        v_cache.len(),
+        scores_scratch.len(),
+        m,
+        n_heads_q,
+        n_heads_kv,
+        head_dim,
+        total_seq_len,
+        kv_row_stride,
+        &kv_head_range,
+        config,
+    )?;
+
+    if kv_head_range.is_empty() {
+        return Ok(());
+    }
+
+    let local_q_heads = kv_head_range.len() * group_size;
+
+    // Outer loop by KV head maximizes L1/L2 reuse of `[0..total_seq_len, kv_h, head_dim]`
+    // across all `m` query tokens and `group_size` Q heads sharing that KV head.
+    for kv_h in kv_head_range.clone() {
+        let local_q_base = (kv_h - kv_head_range.start) * group_size;
+        let kv_head_offset = kv_h * head_dim;
+
+        for m_idx in 0..m {
+            let query_pos = config.start_pos + m_idx;
+            let valid_end = (query_pos + 1).min(total_seq_len);
+            let valid_start = config
+                .sliding_window
+                .map_or(0, |w| query_pos.saturating_add(1).saturating_sub(w));
+            let active_len = valid_end.saturating_sub(valid_start);
+            let score_buf = &mut scores_scratch[..active_len];
+
+            for g in 0..group_size {
+                let global_q_h = kv_h * group_size + g;
+                let local_q_h = local_q_base + g;
+                let q_slice = &q[(m_idx * n_heads_q + global_q_h) * head_dim..][..head_dim];
+
+                for (slot, s) in score_buf.iter_mut().zip(valid_start..valid_end) {
+                    let kv_off = s * kv_row_stride + kv_head_offset;
+                    let k_slice = &k_cache[kv_off..kv_off + head_dim];
+                    let mut score = dot_f32(q_slice, k_slice) * config.scale;
+                    if let Some(cap) = config.logit_softcap {
+                        score = cap * (score / cap).tanh();
+                    }
+                    *slot = score;
+                }
+
+                if active_len > 0 {
+                    softmax_scores_inplace(score_buf);
+                }
+
+                let out_slice =
+                    &mut out[(m_idx * local_q_heads + local_q_h) * head_dim..][..head_dim];
+                out_slice.fill(0.0_f32);
+
+                for (s, &weight) in (valid_start..valid_end).zip(score_buf.iter()) {
+                    if weight == 0.0_f32 {
+                        continue;
+                    }
+                    let kv_off = s * kv_row_stride + kv_head_offset;
+                    let v_slice = &v_cache[kv_off..kv_off + head_dim];
+                    axpy_f32(out_slice, v_slice, weight);
+                }
             }
-        }
-
-        // 2. Numerically stable softmax
-        let mut sum_exp = 0.0_f32;
-        for score in &mut scores[..seq_len] {
-            let exp_val = (*score - max_score).exp();
-            *score = exp_val;
-            sum_exp += exp_val;
-        }
-
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "seq_len fits comfortably in f32"
-        )]
-        let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
-            1.0_f32 / sum_exp
-        } else {
-            1.0_f32 / (seq_len as f32)
-        };
-
-        for score in &mut scores[..seq_len] {
-            *score *= inv_sum;
-        }
-
-        // 3. Weighted accumulation into output head
-        let out_head = &mut out[h_q * head_dim..(h_q + 1) * head_dim];
-        out_head.fill(0.0);
-
-        for (s, &weight) in scores.iter().enumerate().take(seq_len) {
-            if weight == 0.0 {
-                continue;
-            }
-            let kv_offset = (s * n_heads_kv + h_kv) * head_dim;
-            let v_slice = &v_cache[kv_offset..kv_offset + head_dim];
-            axpy_f32(out_head, v_slice, weight);
         }
     }
 
@@ -568,7 +960,10 @@ fn validate_deberta_buffers(
     Ok((hidden, num_buckets))
 }
 
-fn softmax_scores_inplace(scores: &mut [f32]) {
+fn softmax_scores_inplace_scalar(scores: &mut [f32]) {
+    if scores.is_empty() {
+        return;
+    }
     let mut max_score = f32::NEG_INFINITY;
     for &s in scores.iter() {
         if s > max_score {
@@ -589,6 +984,201 @@ fn softmax_scores_inplace(scores: &mut [f32]) {
     };
     for s in scores.iter_mut() {
         *s *= inv_sum;
+    }
+}
+
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[expect(
+    unused_assignments,
+    clippy::too_many_lines,
+    reason = "strip-mined RVV softmax mutates inout pointers and length counters across three passes"
+)]
+fn softmax_scores_inplace_rvv(scores: &mut [f32]) {
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200);
+    const LN2_LO: f32 = 1.428_606_8e-6_f32;
+    const EXP_CONSTS: [f32; 10] = [
+        -87.33_f32,
+        88.0_f32,
+        core::f32::consts::LOG2_E,
+        LN2_HI,
+        LN2_LO,
+        1.0_f32 / 720.0_f32,
+        1.0_f32 / 120.0_f32,
+        1.0_f32 / 24.0_f32,
+        1.0_f32 / 6.0_f32,
+        0.5_f32,
+    ];
+    if scores.is_empty() {
+        return;
+    }
+
+    let mut p_max = scores.as_ptr();
+    let mut rem_max = scores.len();
+    let mut max_score = f32::NEG_INFINITY;
+    // SAFETY: `scores` is non-empty; VLA `e32, m1` `vfredmax.vs` scans `scores` safely.
+    unsafe {
+        core::arch::asm!(
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.s.f v0, {init}",
+            "2:",
+            "vsetvli t0, {rem}, e32, m1, ta, ma",
+            "vle32.v v8, ({p})",
+            "vfredmax.vs v0, v8, v0",
+            "slli t1, t0, 2",
+            "add {p}, {p}, t1",
+            "sub {rem}, {rem}, t0",
+            "bnez {rem}, 2b",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.f.s {out_max}, v0",
+            p = inout(reg) p_max,
+            rem = inout(reg) rem_max,
+            init = in(freg) f32::NEG_INFINITY,
+            out_max = out(freg) max_score,
+            out("t0") _,
+            out("t1") _,
+            out("v0") _,
+            out("v8") _,
+            options(nostack),
+        );
+    }
+
+    if !max_score.is_finite() {
+        softmax_scores_inplace_scalar(scores);
+        return;
+    }
+
+    let mut p_exp = scores.as_mut_ptr();
+    let mut rem_exp = scores.len();
+    let mut sum_exp = 0.0_f32;
+    let pc = EXP_CONSTS.as_ptr();
+    // SAFETY: `scores` is exclusively borrowed and non-empty; Cody-Waite `expf` + `vfredusum.vs`
+    // uses `e32, m1` dynamic `vl` (`VLMAX >= 4` on all RVV `VLEN >= 128`).
+    unsafe {
+        core::arch::asm!(
+            "flw ft0, 0({c})",
+            "flw ft1, 4({c})",
+            "flw ft2, 8({c})",
+            "flw ft3, 12({c})",
+            "flw ft4, 16({c})",
+            "li t2, 127",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.s.f v1, {zero}",
+            "3:",
+            "vsetvli t0, {rem}, e32, m1, ta, ma",
+            "vle32.v v8, ({p})",
+            "vfsub.vf v8, v8, {max_s}",
+            "vmflt.vf v0, v8, ft0",
+            "vfmax.vf v8, v8, ft0",
+            "vfmin.vf v8, v8, ft1",
+            "vfmul.vf v9, v8, ft2",
+            "vfcvt.x.f.v v10, v9",
+            "vfcvt.f.x.v v11, v10",
+            "vfmul.vf v12, v11, ft3",
+            "vfsub.vv v8, v8, v12",
+            "vfmul.vf v12, v11, ft4",
+            "vfsub.vv v8, v8, v12",
+            "flw ft5, 20({c})",
+            "vfmv.v.f v11, ft5",
+            "flw ft6, 24({c})",
+            "vfmul.vv v11, v11, v8",
+            "vfadd.vf v11, v11, ft6",
+            "flw ft5, 28({c})",
+            "vfmul.vv v11, v11, v8",
+            "vfadd.vf v11, v11, ft5",
+            "flw ft6, 32({c})",
+            "vfmul.vv v11, v11, v8",
+            "vfadd.vf v11, v11, ft6",
+            "flw ft5, 36({c})",
+            "vfmul.vv v11, v11, v8",
+            "vfadd.vf v11, v11, ft5",
+            "vfmul.vv v11, v11, v8",
+            "vfadd.vf v11, v11, {one}",
+            "vfmul.vv v11, v11, v8",
+            "vfadd.vf v11, v11, {one}",
+            "vadd.vx v10, v10, t2",
+            "vsll.vi v10, v10, 23",
+            "vfmul.vv v11, v11, v10",
+            "vfmerge.vfm v11, v11, {zero}, v0",
+            "vse32.v v11, ({p})",
+            "vfredusum.vs v1, v11, v1",
+            "slli t1, t0, 2",
+            "add {p}, {p}, t1",
+            "sub {rem}, {rem}, t0",
+            "bnez {rem}, 3b",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.f.s {out_sum}, v1",
+            p = inout(reg) p_exp,
+            rem = inout(reg) rem_exp,
+            c = in(reg) pc,
+            max_s = in(freg) max_score,
+            one = in(freg) 1.0_f32,
+            zero = in(freg) 0.0_f32,
+            out_sum = out(freg) sum_exp,
+            out("t0") _,
+            out("t1") _,
+            out("t2") _,
+            out("ft0") _,
+            out("ft1") _,
+            out("ft2") _,
+            out("ft3") _,
+            out("ft4") _,
+            out("ft5") _,
+            out("ft6") _,
+            out("v0") _,
+            out("v1") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            out("v12") _,
+            options(nostack),
+        );
+    }
+
+    if !(sum_exp > 0.0 && sum_exp.is_finite()) {
+        #[expect(clippy::cast_precision_loss, reason = "sequence length fits in f32")]
+        let uniform = 1.0_f32 / (scores.len() as f32);
+        scores.fill(uniform);
+        return;
+    }
+
+    let inv_sum = 1.0_f32 / sum_exp;
+    let mut p_norm = scores.as_mut_ptr();
+    let mut rem_norm = scores.len();
+    // SAFETY: `scores` is valid for `rem_norm` elements; `e32, m4` scale loop normalizes probabilities.
+    unsafe {
+        core::arch::asm!(
+            "4:",
+            "vsetvli t0, {rem}, e32, m4, ta, ma",
+            "vle32.v v8, ({p})",
+            "vfmul.vf v8, v8, {inv}",
+            "vse32.v v8, ({p})",
+            "slli t1, t0, 2",
+            "add {p}, {p}, t1",
+            "sub {rem}, {rem}, t0",
+            "bnez {rem}, 4b",
+            p = inout(reg) p_norm,
+            rem = inout(reg) rem_norm,
+            inv = in(freg) inv_sum,
+            out("t0") _,
+            out("t1") _,
+            out("v8") _,
+            out("v9") _,
+            out("v10") _,
+            out("v11") _,
+            options(nostack),
+        );
+    }
+}
+
+fn softmax_scores_inplace(scores: &mut [f32]) {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        softmax_scores_inplace_rvv(scores);
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        softmax_scores_inplace_scalar(scores);
     }
 }
 
@@ -1467,5 +2057,115 @@ mod tests {
             gated_deltanet_step_f32(&mut state, &mut out, &q, &k, &v, &decay_gate, &beta, 0, 3),
             Err(K3Error::CapabilityMismatch { .. })
         ));
+    }
+
+    fn make_wave3_seq(len: usize, mul: usize, modulo: usize, bias: f32, step: f32) -> Vec<f32> {
+        (0..len)
+            .map(|idx| (f32::from(u8::try_from((idx * mul) % modulo).unwrap()) - bias) * step)
+            .collect()
+    }
+
+    #[test]
+    fn wave3_gqa_prefill_matches_sequential_decode_with_swa_and_softcap() {
+        let m_tokens = 6;
+        let start_pos = 3;
+        let total_seq = start_pos + m_tokens;
+        let (n_q, n_kv, head_dim) = (4, 2, 8);
+        let scale = 1.0_f32 / 8.0_f32.sqrt();
+        let q_buf = make_wave3_seq(m_tokens * n_q * head_dim, 1, 13, 6.0, 0.15);
+        let k_buf = make_wave3_seq(total_seq * n_kv * head_dim, 3, 11, 5.0, 0.12);
+        let v_buf = make_wave3_seq(total_seq * n_kv * head_dim, 5, 17, 8.0, 0.1);
+
+        let cfg = AttentionMaskConfig::causal(start_pos, scale);
+        let mut scratch = vec![0.0_f32; total_seq];
+        let mut out_prefill = vec![0.0_f32; m_tokens * n_q * head_dim];
+        gqa_causal_attention_prefill_f32(
+            &mut out_prefill,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            m_tokens,
+            n_q,
+            n_kv,
+            head_dim,
+            total_seq,
+            cfg,
+            &mut scratch,
+        )
+        .unwrap();
+
+        let mut out_seq = vec![0.0_f32; n_q * head_dim];
+        for tok in 0..m_tokens {
+            let valid_seq = start_pos + tok + 1;
+            gqa_causal_attention_with_scratch_f32(
+                &mut out_seq,
+                &q_buf[tok * n_q * head_dim..(tok + 1) * n_q * head_dim],
+                &k_buf[..valid_seq * n_kv * head_dim],
+                &v_buf[..valid_seq * n_kv * head_dim],
+                n_q,
+                n_kv,
+                head_dim,
+                valid_seq,
+                scale,
+                &mut scratch,
+            )
+            .unwrap();
+            for idx in 0..n_q * head_dim {
+                assert!(
+                    (out_prefill[tok * n_q * head_dim + idx] - out_seq[idx]).abs() < 1e-6,
+                    "tok={tok} idx={idx}"
+                );
+            }
+        }
+
+        let cfg_swa = AttentionMaskConfig::causal(start_pos, scale)
+            .with_sliding_window(Some(3))
+            .with_logit_softcap(Some(2.0));
+        let mut out_swa = vec![0.0_f32; m_tokens * n_q * head_dim];
+        gqa_causal_attention_prefill_f32(
+            &mut out_swa,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            m_tokens,
+            n_q,
+            n_kv,
+            head_dim,
+            total_seq,
+            cfg_swa,
+            &mut scratch,
+        )
+        .unwrap();
+        assert!(out_swa.iter().all(|x| x.is_finite()));
+
+        let (kv_r0, q_r0) = gqa_kv_head_partition(n_kv, n_q, 0, 2).unwrap();
+        assert_eq!(kv_r0, 0..1);
+        assert_eq!(q_r0, 0..2);
+        let mut part0 = vec![0.0_f32; m_tokens * 2 * head_dim];
+        gqa_causal_attention_prefill_kv_heads_f32(
+            &mut part0,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            m_tokens,
+            n_q,
+            n_kv,
+            head_dim,
+            total_seq,
+            kv_r0,
+            cfg_swa,
+            &mut scratch,
+        )
+        .unwrap();
+        for tok in 0..m_tokens {
+            let lhs = &part0[tok * 2 * head_dim..(tok + 1) * 2 * head_dim];
+            let rhs = &out_swa[tok * n_q * head_dim..tok * n_q * head_dim + 2 * head_dim];
+            #[cfg(not(miri))]
+            assert_eq!(lhs, rhs);
+            for (idx, (a, b)) in lhs.iter().zip(rhs.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-6, "tok={tok} idx={idx}: {a} vs {b}");
+            }
+        }
+        assert!(gqa_kv_head_partition(n_kv, n_q, 2, 2).is_none());
     }
 }
