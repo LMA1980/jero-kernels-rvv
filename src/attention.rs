@@ -12,7 +12,7 @@ use crate::dot_product_f32_rvv;
 use crate::dot_product_f32_scalar;
 
 #[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(all(target_arch = "riscv64", not(miri)))]
     {
         dot_product_f32_rvv(a, b)
@@ -70,7 +70,7 @@ fn axpy_f32_rvv(out: &mut [f32], x: &[f32], alpha: f32) {
 }
 
 #[inline]
-fn axpy_f32(out: &mut [f32], x: &[f32], alpha: f32) {
+pub(crate) fn axpy_f32(out: &mut [f32], x: &[f32], alpha: f32) {
     #[cfg(all(target_arch = "riscv64", not(miri)))]
     {
         axpy_f32_rvv(out, x, alpha);
