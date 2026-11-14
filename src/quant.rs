@@ -471,7 +471,7 @@ pub fn dequantize_iq4_nl_row_rvv(row_bytes: &[u8], out: &mut [f32]) -> Result<()
         .zip(out.chunks_exact_mut(IQ4_NL_BLOCK_ELEMENTS))
     {
         let d = f16_to_f32_finite(u16::from_le_bytes([blk_bytes[0], blk_bytes[1]]));
-        if d == 0.0 {
+        if d == 0.0 && d.is_sign_positive() {
             out_chunk.fill(0.0);
             continue;
         }
@@ -480,8 +480,11 @@ pub fn dequantize_iq4_nl_row_rvv(row_bytes: &[u8], out: &mut [f32]) -> Result<()
         let out_lo_ptr = out_chunk.as_mut_ptr();
         // SAFETY: `KVALUES_IQ4NL` holds 16 valid `i8` bytes, `qs_ptr` holds 16 packed bytes, and
         // `out_lo_ptr` points to 32 writable `f32` elements (`[0..16]` low, `[16..32]` high).
-        // Under `VLEN >= 128`, `LMUL = 1` at `e8` holds all 16 table entries in `v8`, and
-        // `vrgather.vv` destinations (`v4`, `v5`) do not overlap sources (`v8`, `v2`, `v3`).
+        // Under `VLEN >= 128`, `LMUL = 1` at `e8` holds all 16 table entries in `v8`,
+        // `vrgather.vv` destinations (`v4`, `v5`) do not overlap sources (`v8`, `v2`, `v3`), and
+        // `e32, m4` guarantees `VLMAX >= 16` across all `VLEN >= 128` implementations
+        // (`VLEN = 128/256/1024`) with disjoint 4-register aligned destination groups (`v12..v15`,
+        // `v16..v19`).
         unsafe {
             let out_hi_ptr = out_lo_ptr.add(16);
             core::arch::asm!(
@@ -492,15 +495,15 @@ pub fn dequantize_iq4_nl_row_rvv(row_bytes: &[u8], out: &mut [f32]) -> Result<()
                 "vsrl.vi v3, v1, 4",
                 "vrgather.vv v4, v8, v2",
                 "vrgather.vv v5, v8, v3",
-                "vsetivli zero, 16, e32, m2, ta, ma",
+                "vsetivli zero, 16, e32, m4, ta, ma",
                 "vsext.vf4 v12, v4",
                 "vfcvt.f.x.v v12, v12",
                 "vfmul.vf v12, v12, {d}",
                 "vse32.v v12, ({out_lo})",
-                "vsext.vf4 v14, v5",
-                "vfcvt.f.x.v v14, v14",
-                "vfmul.vf v14, v14, {d}",
-                "vse32.v v14, ({out_hi})",
+                "vsext.vf4 v16, v5",
+                "vfcvt.f.x.v v16, v16",
+                "vfmul.vf v16, v16, {d}",
+                "vse32.v v16, ({out_hi})",
                 tbl = in(reg) tbl_ptr,
                 qs = in(reg) qs_ptr,
                 out_lo = in(reg) out_lo_ptr,
@@ -516,6 +519,10 @@ pub fn dequantize_iq4_nl_row_rvv(row_bytes: &[u8], out: &mut [f32]) -> Result<()
                 out("v13") _,
                 out("v14") _,
                 out("v15") _,
+                out("v16") _,
+                out("v17") _,
+                out("v18") _,
+                out("v19") _,
                 options(nostack),
             );
         }
@@ -3213,6 +3220,99 @@ mod tests {
                 dequantize_row_bytes(unsup, &raw, 32, &mut out32),
                 Err(K3Error::CapabilityMismatch { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn test_iq4_nl_all_lanes_sentinel_and_vlen128_geometry() {
+        let rvv_vlmax =
+            |vlen_bits: usize, sew_bits: usize, lmul: usize| (vlen_bits / sew_bits) * lmul;
+        // Under VLEN = 128, e32/m2 gives VLMAX = 8 (insufficient for 16 elements), whereas e32/m4
+        // yields VLMAX >= 16 across all RVV 1.0 VLEN >= 128 implementations.
+        assert_eq!(rvv_vlmax(128, 32, 2), 8);
+        for vlen in [128_usize, 256, 512, 1024] {
+            assert!(rvv_vlmax(vlen, 8, 1) >= 16);
+            assert!(rvv_vlmax(vlen, 32, 4) >= 16);
+        }
+
+        // Four blocks (128 elements): cover distinct nibbles across [0..8], [8..16], [16..24],
+        // and [24..32], plus positive, negative, +0.0, -0.0, and non-finite (clamped) scales.
+        let scales_f16: [u16; 4] = [0x3C00, 0xB800, 0x8000, 0x7E00];
+        let mut raw = [0_u8; 4 * IQ4_NL_BLOCK_BYTES];
+        let mut oracle = [-999.25_f32; 4 * IQ4_NL_BLOCK_ELEMENTS];
+        for (b, &scale_bits) in scales_f16.iter().enumerate() {
+            let base = b * IQ4_NL_BLOCK_BYTES;
+            raw[base..base + 2].copy_from_slice(&scale_bits.to_le_bytes());
+            for j in 0_u8..16 {
+                let lo = (j.wrapping_add(u8::try_from(b * 3).unwrap())) & 0x0F;
+                let hi = (15_u8.wrapping_sub(j).wrapping_add(u8::try_from(b).unwrap())) & 0x0F;
+                raw[base + 2 + usize::from(j)] = (hi << 4) | lo;
+            }
+            let blk: &[u8; IQ4_NL_BLOCK_BYTES] = raw[base..base + IQ4_NL_BLOCK_BYTES]
+                .try_into()
+                .expect("18-byte IQ4_NL block");
+            let dst: &mut [f32; IQ4_NL_BLOCK_ELEMENTS] = (&mut oracle
+                [b * IQ4_NL_BLOCK_ELEMENTS..(b + 1) * IQ4_NL_BLOCK_ELEMENTS])
+                .try_into()
+                .expect("32-element output slice");
+            dequantize_iq4_nl_block(blk, dst);
+        }
+
+        let mut out = [-999.25_f32; 4 * IQ4_NL_BLOCK_ELEMENTS];
+        dequantize_row_bytes(QuantType::IQ4_NL, &raw, 4 * IQ4_NL_BLOCK_ELEMENTS, &mut out)
+            .expect("IQ4_NL sentinel-prefilled row");
+        for (idx, (&actual, &expected)) in out.iter().zip(&oracle).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "IQ4_NL lane {idx} mismatch"
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    #[test]
+    fn test_iq4_nl_row_rvv_vlen128_contract_and_bit_exact_parity() {
+        let mut vl: usize;
+        // SAFETY: `vsetivli` updates VL/VTYPE CSRs without touching memory.
+        unsafe {
+            core::arch::asm!(
+                "vsetivli {vl}, 16, e32, m4, ta, ma",
+                vl = out(reg) vl,
+                options(nomem, nostack),
+            );
+        }
+        assert_eq!(vl, 16, "e32/m4 must grant vl=16 across all VLEN >= 128");
+
+        let scales_f16: [u16; 3] = [0x3800, 0xBC00, 0x8000];
+        let mut raw = [0_u8; 3 * IQ4_NL_BLOCK_BYTES];
+        let mut oracle = [0.0_f32; 3 * IQ4_NL_BLOCK_ELEMENTS];
+        for (b, &scale_bits) in scales_f16.iter().enumerate() {
+            let base = b * IQ4_NL_BLOCK_BYTES;
+            raw[base..base + 2].copy_from_slice(&scale_bits.to_le_bytes());
+            for j in 0_u8..16 {
+                let lo = (j + u8::try_from(b).unwrap()) & 0x0F;
+                let hi = (15_u8 - j) & 0x0F;
+                raw[base + 2 + usize::from(j)] = (hi << 4) | lo;
+            }
+            let blk: &[u8; IQ4_NL_BLOCK_BYTES] = raw[base..base + IQ4_NL_BLOCK_BYTES]
+                .try_into()
+                .expect("18-byte IQ4_NL block");
+            let dst: &mut [f32; IQ4_NL_BLOCK_ELEMENTS] = (&mut oracle
+                [b * IQ4_NL_BLOCK_ELEMENTS..(b + 1) * IQ4_NL_BLOCK_ELEMENTS])
+                .try_into()
+                .expect("32-element output slice");
+            dequantize_iq4_nl_block(blk, dst);
+        }
+
+        let mut out = [-1234.5_f32; 3 * IQ4_NL_BLOCK_ELEMENTS];
+        dequantize_iq4_nl_row_rvv(&raw, &mut out).expect("RVV IQ4_NL dequantize succeeds");
+        for (idx, (&actual, &expected)) in out.iter().zip(&oracle).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "IQ4_NL RVV lane {idx} mismatch"
+            );
         }
     }
 }
