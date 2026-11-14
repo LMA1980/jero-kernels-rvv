@@ -410,6 +410,269 @@ pub fn pool_sequence_f32(
     }
 }
 
+/// Computes the `DeBERTa-v3` log-bucketed relative position index for `(q_idx, k_idx)` over
+/// `2 * max_rel_pos` buckets centered at `max_rel_pos`.
+///
+/// Exact relative offsets inside `max_rel_pos / 2` map linearly, while larger distances map
+/// logarithmically into the remaining buckets within `0..2 * max_rel_pos`. Returns `0` when
+/// `max_rel_pos == 0`.
+#[must_use]
+pub fn compute_deberta_rel_pos_bucket(q_idx: usize, k_idx: usize, max_rel_pos: usize) -> usize {
+    if max_rel_pos == 0 {
+        return 0;
+    }
+    if q_idx == k_idx {
+        return max_rel_pos;
+    }
+
+    let abs_d = q_idx.abs_diff(k_idx);
+    let half = (max_rel_pos / 2).max(1);
+    let mag = if abs_d < half || half >= max_rel_pos {
+        abs_d.min(max_rel_pos)
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = ((abs_d as f32) / (half as f32)).ln()
+            / (((2 * max_rel_pos) as f32) / (half as f32)).ln();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let scaled =
+            half + ((ratio.clamp(0.0, 1.0) * ((max_rel_pos - half) as f32)).floor() as usize);
+        scaled.clamp(half, max_rel_pos)
+    };
+
+    if q_idx < k_idx {
+        max_rel_pos.saturating_sub(mag)
+    } else {
+        (max_rel_pos + mag).min(2 * max_rel_pos - 1)
+    }
+}
+
+/// Computes the disentangled attention scaling factor `1.0 / sqrt(3.0 * head_dim)` for `DeBERTa-v3`.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `head_dim == 0`.
+pub fn deberta_attention_scale(head_dim: usize) -> Result<f32, K3Error> {
+    if head_dim == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "deberta-v3".to_owned(),
+            reason: "head_dim must be non-zero for DeBERTa-v3 scale normalization".to_owned(),
+        });
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let denom = (3.0_f32 * (head_dim as f32)).sqrt();
+    Ok(1.0_f32 / denom)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_deberta_buffers(
+    out_len: usize,
+    q_content_len: usize,
+    k_content_len: usize,
+    v_content_len: usize,
+    q_pos_len: usize,
+    k_pos_len: usize,
+    rel_pos_buckets: &[usize],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<(usize, usize), K3Error> {
+    if seq_len == 0 || n_heads == 0 || head_dim == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "deberta-v3".to_owned(),
+            reason: "seq_len, n_heads, and head_dim must be non-zero".to_owned(),
+        });
+    }
+
+    let hidden = n_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "deberta-v3".to_owned(),
+            reason: "hidden dimension overflow usize".to_owned(),
+        })?;
+    let expected_len = seq_len
+        .checked_mul(hidden)
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "deberta-v3".to_owned(),
+            reason: "sequence tensor length overflow usize".to_owned(),
+        })?;
+    let expected_bytes = expected_len.saturating_mul(size_of::<f32>());
+
+    for (name, len) in [
+        ("out", out_len),
+        ("q_content", q_content_len),
+        ("k_content", k_content_len),
+        ("v_content", v_content_len),
+    ] {
+        if len != expected_len {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: expected_bytes,
+                buffer_len: len.saturating_mul(size_of::<f32>()),
+                reason: format!("expected {expected_len} elements for {name}, got {len}"),
+            });
+        }
+    }
+
+    let expected_bucket_len =
+        seq_len
+            .checked_mul(seq_len)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "deberta-v3".to_owned(),
+                reason: "rel_pos_buckets dimension overflow usize".to_owned(),
+            })?;
+    if rel_pos_buckets.len() != expected_bucket_len {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "rel_pos_buckets".to_owned(),
+            offset: 0,
+            byte_len: expected_bucket_len.saturating_mul(size_of::<usize>()),
+            buffer_len: rel_pos_buckets.len().saturating_mul(size_of::<usize>()),
+            reason: format!(
+                "expected {expected_bucket_len} relative bucket entries, got {}",
+                rel_pos_buckets.len()
+            ),
+        });
+    }
+
+    if q_pos_len != k_pos_len || q_pos_len < hidden || q_pos_len % hidden != 0 {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "pos_embeddings".to_owned(),
+            offset: 0,
+            byte_len: k_pos_len.saturating_mul(size_of::<f32>()),
+            buffer_len: q_pos_len.saturating_mul(size_of::<f32>()),
+            reason: format!(
+                "q_pos ({q_pos_len}) and k_pos ({k_pos_len}) must match and be non-zero multiples of hidden ({hidden})"
+            ),
+        });
+    }
+
+    let num_buckets = q_pos_len / hidden;
+    for (idx, &bucket) in rel_pos_buckets.iter().enumerate() {
+        if bucket >= num_buckets {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: "rel_pos_buckets".to_owned(),
+                offset: idx,
+                byte_len: size_of::<usize>(),
+                buffer_len: num_buckets,
+                reason: format!(
+                    "relative position bucket {bucket} at index {idx} out of range 0..{num_buckets}"
+                ),
+            });
+        }
+    }
+
+    Ok((hidden, num_buckets))
+}
+
+fn softmax_scores_inplace(scores: &mut [f32]) {
+    let mut max_score = f32::NEG_INFINITY;
+    for &s in scores.iter() {
+        if s > max_score {
+            max_score = s;
+        }
+    }
+    let mut sum_exp = 0.0_f32;
+    for s in scores.iter_mut() {
+        let e = (*s - max_score).exp();
+        *s = e;
+        sum_exp += e;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let inv_sum = if sum_exp > 0.0 && sum_exp.is_finite() {
+        1.0_f32 / sum_exp
+    } else {
+        1.0_f32 / (scores.len().max(1) as f32)
+    };
+    for s in scores.iter_mut() {
+        *s *= inv_sum;
+    }
+}
+
+/// Computes `DeBERTa-v3` disentangled relative positional attention across `seq_len` tokens:
+/// `A_{i,j} = (Q^c_i (K^c_j)^T + Q^c_i (K^r_{b(i,j)})^T + K^c_j (Q^r_{b(j,i)})^T) / sqrt(3 * head_dim)`.
+///
+/// Tensor layout for `out`, `q_content`, `k_content`, and `v_content` is row-major
+/// `[seq_len, n_heads, head_dim]`, while `q_pos` and `k_pos` have shape
+/// `[num_buckets, n_heads, head_dim]` indexed by `rel_pos_buckets[i * seq_len + j]`.
+///
+/// # Errors
+///
+/// Returns [`K3Error::CapabilityMismatch`] if `seq_len`, `n_heads`, or `head_dim` is zero or overflows,
+/// or [`K3Error::TensorBoundsError`] if tensor lengths or bucket indices are out of bounds.
+#[allow(clippy::too_many_arguments)]
+pub fn deberta_disentangled_attention_f32(
+    out: &mut [f32],
+    q_content: &[f32],
+    k_content: &[f32],
+    v_content: &[f32],
+    q_pos: &[f32],
+    k_pos: &[f32],
+    rel_pos_buckets: &[usize],
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<(), K3Error> {
+    let (hidden, _num_buckets) = validate_deberta_buffers(
+        out.len(),
+        q_content.len(),
+        k_content.len(),
+        v_content.len(),
+        q_pos.len(),
+        k_pos.len(),
+        rel_pos_buckets,
+        seq_len,
+        n_heads,
+        head_dim,
+    )?;
+
+    let scale = deberta_attention_scale(head_dim)?;
+    let mut scores = vec![0.0_f32; seq_len];
+
+    for i in 0..seq_len {
+        for h in 0..n_heads {
+            let head_base = i * hidden + h * head_dim;
+            let qc = &q_content[head_base..head_base + head_dim];
+
+            for (j, score_slot) in scores.iter_mut().enumerate().take(seq_len) {
+                let key_offset = j * hidden + h * head_dim;
+                let kc = &k_content[key_offset..key_offset + head_dim];
+
+                let bucket_ij = rel_pos_buckets[i * seq_len + j];
+                let k_pos_offset = bucket_ij * hidden + h * head_dim;
+                let kr = &k_pos[k_pos_offset..k_pos_offset + head_dim];
+
+                let bucket_ji = rel_pos_buckets[j * seq_len + i];
+                let q_pos_offset = bucket_ji * hidden + h * head_dim;
+                let qr = &q_pos[q_pos_offset..q_pos_offset + head_dim];
+
+                let c2c = dot_f32(qc, kc);
+                let c2p = dot_f32(qc, kr);
+                let p2c = dot_f32(kc, qr);
+                *score_slot = (c2c + c2p + p2c) * scale;
+            }
+
+            softmax_scores_inplace(&mut scores[..seq_len]);
+
+            let out_head = &mut out[head_base..head_base + head_dim];
+            out_head.fill(0.0);
+            for (j, &weight) in scores.iter().enumerate().take(seq_len) {
+                if weight == 0.0 {
+                    continue;
+                }
+                let v_base = j * hidden + h * head_dim;
+                let vc = &v_content[v_base..v_base + head_dim];
+                axpy_f32(out_head, vc, weight);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +818,211 @@ mod tests {
         pool_sequence_f32(&mut mean_out, &hidden, 3, 2, true);
         assert!((mean_out[0] - 3.0).abs() <= 1e-6);
         assert!((mean_out[1] - 4.0).abs() <= 1e-6);
+    }
+
+    #[test]
+    fn test_compute_deberta_rel_pos_bucket() {
+        let max_rel_pos = 16;
+        // Center bucket for identical query/key positions
+        assert_eq!(
+            compute_deberta_rel_pos_bucket(5, 5, max_rel_pos),
+            max_rel_pos
+        );
+        // Edge case max_rel_pos == 0
+        assert_eq!(compute_deberta_rel_pos_bucket(0, 3, 0), 0);
+
+        // Exact small linear offsets around center (half = 8)
+        assert_eq!(compute_deberta_rel_pos_bucket(5, 6, max_rel_pos), 15);
+        assert_eq!(compute_deberta_rel_pos_bucket(6, 5, max_rel_pos), 17);
+
+        // Antisymmetry & monotonic clamping in [0, 2 * max_rel_pos)
+        let left_far = compute_deberta_rel_pos_bucket(0, 200, max_rel_pos);
+        let right_far = compute_deberta_rel_pos_bucket(200, 0, max_rel_pos);
+        assert_eq!(left_far, 0);
+        assert_eq!(right_far, 2 * max_rel_pos - 1);
+
+        // Scale factor 1 / sqrt(3 * head_dim)
+        let scale = deberta_attention_scale(12).expect("valid scale");
+        assert!((scale - (1.0_f32 / 6.0_f32)).abs() <= 1e-6);
+        assert!(matches!(
+            deberta_attention_scale(0),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_deberta_disentangled_attention_f32() {
+        // Test C2P + P2C bias sensitivity when C2C content vectors are identical across keys.
+        let seq_len = 2;
+        let n_heads = 1;
+        let head_dim = 2;
+        let max_rel_pos = 2;
+        let num_buckets = 2 * max_rel_pos; // 4
+
+        let q_content = [1.0_f32, 0.0, 1.0, 0.0];
+        let k_content = [1.0_f32, 0.0, 1.0, 0.0];
+        let v_content = [10.0_f32, 0.0, 0.0, 20.0];
+
+        let mut rel_pos_buckets = [0_usize; 4];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                rel_pos_buckets[i * seq_len + j] =
+                    compute_deberta_rel_pos_bucket(i, j, max_rel_pos);
+            }
+        }
+        // Bucket 1 = rel(-1) (i=0, j=1); Bucket 2 = rel(0); Bucket 3 = rel(+1) (i=1, j=0)
+        let mut q_pos = vec![0.0_f32; num_buckets * head_dim];
+        let mut k_pos = vec![0.0_f32; num_buckets * head_dim];
+        // Make bucket 1 strongly attractive to q_content=[1, 0] via c2p
+        k_pos[head_dim] = 10.0;
+        // Make bucket 3 strongly unattractive via c2p
+        k_pos[3 * head_dim] = -10.0;
+        // Neutral self-position, positive p2c at bucket 3 when querying j=1 from i=0 (b_{1,0}=3)
+        q_pos[3 * head_dim] = 5.0;
+
+        let mut out = [0.0_f32; 4];
+        deberta_disentangled_attention_f32(
+            &mut out,
+            &q_content,
+            &k_content,
+            &v_content,
+            &q_pos,
+            &k_pos,
+            &rel_pos_buckets,
+            seq_len,
+            n_heads,
+            head_dim,
+        )
+        .expect("disentangled attention succeeds");
+
+        // Token 0 must focus overwhelmingly on token 1 (v_content[1] = [0, 20])
+        assert!(
+            out[1] > 18.0 && out[0] < 2.0,
+            "tok 0 must attend to tok 1 via C2P+P2C: out={out:?}"
+        );
+        assert!(out.iter().all(|v| v.is_finite()));
+
+        // Error checks
+        assert!(matches!(
+            deberta_disentangled_attention_f32(
+                &mut out[..2],
+                &q_content,
+                &k_content,
+                &v_content,
+                &q_pos,
+                &k_pos,
+                &rel_pos_buckets,
+                seq_len,
+                n_heads,
+                head_dim,
+            ),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+        let mut bad_buckets = rel_pos_buckets;
+        bad_buckets[0] = num_buckets;
+        assert!(matches!(
+            deberta_disentangled_attention_f32(
+                &mut out,
+                &q_content,
+                &k_content,
+                &v_content,
+                &q_pos,
+                &k_pos,
+                &bad_buckets,
+                seq_len,
+                n_heads,
+                head_dim,
+            ),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_deberta_c2p_p2c_attention() {
+        // Multi-head numerical parity check against reference scalar computation with 1/sqrt(3d)
+        let seq_len = 3;
+        let n_heads = 2;
+        let head_dim = 4;
+        let hidden = n_heads * head_dim;
+        let max_rel_pos = 4;
+        let num_buckets = 2 * max_rel_pos;
+
+        let mut rel_pos_buckets = vec![0_usize; seq_len * seq_len];
+        for i in 0..seq_len {
+            for j in 0..seq_len {
+                rel_pos_buckets[i * seq_len + j] =
+                    compute_deberta_rel_pos_bucket(i, j, max_rel_pos);
+            }
+        }
+
+        let q_c: Vec<f32> = (0..seq_len * hidden)
+            .map(|x| ((x % 7) as f32 - 3.0) * 0.25)
+            .collect();
+        let k_c: Vec<f32> = (0..seq_len * hidden)
+            .map(|x| ((x % 5) as f32 - 2.0) * 0.3)
+            .collect();
+        let v_c: Vec<f32> = (0..seq_len * hidden).map(|x| (x as f32) * 0.1).collect();
+        let q_p: Vec<f32> = (0..num_buckets * hidden)
+            .map(|x| ((x % 6) as f32 - 2.5) * 0.2)
+            .collect();
+        let k_p: Vec<f32> = (0..num_buckets * hidden)
+            .map(|x| ((x % 4) as f32 - 1.5) * 0.35)
+            .collect();
+
+        let mut out = vec![0.0_f32; seq_len * hidden];
+        deberta_disentangled_attention_f32(
+            &mut out,
+            &q_c,
+            &k_c,
+            &v_c,
+            &q_p,
+            &k_p,
+            &rel_pos_buckets,
+            seq_len,
+            n_heads,
+            head_dim,
+        )
+        .expect("multi-head c2p+p2c attention succeeds");
+
+        // Compare head 1 of token 2 with pure content-only attention (zero position tables):
+        // c2p + p2c must produce distinct contextual outputs.
+        let zero_pos = vec![0.0_f32; num_buckets * hidden];
+        let mut out_no_pos = vec![0.0_f32; seq_len * hidden];
+        deberta_disentangled_attention_f32(
+            &mut out_no_pos,
+            &q_c,
+            &k_c,
+            &v_c,
+            &zero_pos,
+            &zero_pos,
+            &rel_pos_buckets,
+            seq_len,
+            n_heads,
+            head_dim,
+        )
+        .expect("c2c-only attention succeeds");
+
+        let max_diff = out
+            .iter()
+            .zip(out_no_pos.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_diff > 1e-3, "c2p+p2c must contribute non-trivially");
+    }
+
+    #[test]
+    fn test_deberta_disentangled_attention() {
+        let mut out = [0.0_f32; 4];
+        let q = [1.0_f32, 0.0, 0.0, 1.0];
+        let k = [1.0_f32, 0.0, 0.0, 1.0];
+        let v = [2.0_f32, 4.0, 6.0, 8.0];
+        let q_pos = [0.5_f32, 0.0, 0.0, 0.5, 0.1, 0.2, 0.3, 0.4];
+        let k_pos = [0.5_f32, 0.0, 0.0, 0.5, 0.1, 0.2, 0.3, 0.4];
+        let buckets = [2_usize, 1, 3, 2];
+
+        deberta_disentangled_attention_f32(&mut out, &q, &k, &v, &q_pos, &k_pos, &buckets, 2, 1, 2)
+            .expect("disentangled attention integration smoke check");
+        assert!(out.iter().all(|x| x.is_finite()));
     }
 }
