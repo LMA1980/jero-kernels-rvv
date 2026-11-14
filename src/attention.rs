@@ -673,6 +673,231 @@ pub fn deberta_disentangled_attention_f32(
     Ok(())
 }
 
+/// Computes `DeepSeek` Multi-Head Latent Attention (`MLA`) in compressed latent space with
+/// absorbed `W_UK` and `W_UV` projections.
+///
+/// Instead of materializing uncompressed `[seq_len, n_heads, head_dim]` K/V tensors, this kernel
+/// scores absorbed nope queries (`q_nope: [n_heads, kv_lora_rank]`) + decoupled rotary queries
+/// (`q_rotary: [n_heads, rope_dim]`) directly against the compressed latent cache
+/// `kv_latent_cache: [seq_len, kv_lora_rank + rope_dim]`, and accumulates softmax-weighted latent
+/// representations into `out_latent: [n_heads, kv_lora_rank]` via RVV `dot_f32` and `axpy_f32`.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `n_heads`, `kv_lora_rank`, or `seq_len` is zero,
+///   if `scale` is non-finite, or if dimensions overflow `usize`.
+/// - Returns [`K3Error::TensorBoundsError`] if any slice length mismatches expected bounds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "MLA kernel takes explicit absorbed query, latent KV cache, and geometry parameters"
+)]
+pub fn mla_absorbed_attention_f32(
+    out_latent: &mut [f32],
+    q_nope: &[f32],
+    q_rotary: &[f32],
+    kv_latent_cache: &[f32],
+    n_heads: usize,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+    seq_len: usize,
+    scale: f32,
+) -> Result<(), K3Error> {
+    if n_heads == 0 || kv_lora_rank == 0 || seq_len == 0 || !scale.is_finite() {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "deepseek2".to_owned(),
+            reason: format!(
+                "invalid MLA parameters: n_heads={n_heads}, kv_lora_rank={kv_lora_rank}, seq_len={seq_len}, scale={scale}"
+            ),
+        });
+    }
+
+    let expected_latent =
+        n_heads
+            .checked_mul(kv_lora_rank)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "deepseek2".to_owned(),
+                reason: "MLA out_latent dimension overflowed usize".to_owned(),
+            })?;
+    let expected_rope =
+        n_heads
+            .checked_mul(rope_dim)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "deepseek2".to_owned(),
+                reason: "MLA q_rope dimension overflowed usize".to_owned(),
+            })?;
+    let stride = kv_lora_rank
+        .checked_add(rope_dim)
+        .ok_or_else(|| K3Error::CapabilityMismatch {
+            architecture: "deepseek2".to_owned(),
+            reason: "MLA latent cache stride overflowed usize".to_owned(),
+        })?;
+    let expected_cache =
+        seq_len
+            .checked_mul(stride)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "deepseek2".to_owned(),
+                reason: "MLA cache length overflowed usize".to_owned(),
+            })?;
+
+    for (name, actual, expected) in [
+        ("out_latent", out_latent.len(), expected_latent),
+        ("q_nope", q_nope.len(), expected_latent),
+        ("q_rotary", q_rotary.len(), expected_rope),
+    ] {
+        if actual != expected {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: actual.saturating_mul(size_of::<f32>()),
+                buffer_len: expected.saturating_mul(size_of::<f32>()),
+                reason: format!("MLA buffer '{name}' length {actual} != expected {expected}"),
+            });
+        }
+    }
+
+    if kv_latent_cache.len() < expected_cache {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: "kv_latent_cache".to_owned(),
+            offset: 0,
+            byte_len: kv_latent_cache.len().saturating_mul(size_of::<f32>()),
+            buffer_len: expected_cache.saturating_mul(size_of::<f32>()),
+            reason: format!(
+                "kv_latent_cache length {} < expected {expected_cache}",
+                kv_latent_cache.len()
+            ),
+        });
+    }
+
+    let mut scores = vec![0.0_f32; seq_len];
+
+    for h in 0..n_heads {
+        let q_abs_h = &q_nope[h * kv_lora_rank..(h + 1) * kv_lora_rank];
+        let q_rot_h = &q_rotary[h * rope_dim..(h + 1) * rope_dim];
+
+        for (t, score_slot) in scores.iter_mut().enumerate().take(seq_len) {
+            let base = t * stride;
+            let c_kv = &kv_latent_cache[base..base + kv_lora_rank];
+            let score_nope = dot_f32(q_abs_h, c_kv);
+            let score_rotary = if rope_dim > 0 {
+                let k_rope = &kv_latent_cache[base + kv_lora_rank..base + stride];
+                dot_f32(q_rot_h, k_rope)
+            } else {
+                0.0
+            };
+            *score_slot = (score_nope + score_rotary) * scale;
+        }
+
+        softmax_scores_inplace(&mut scores[..seq_len]);
+
+        let out_h = &mut out_latent[h * kv_lora_rank..(h + 1) * kv_lora_rank];
+        out_h.fill(0.0);
+
+        for (t, &weight) in scores.iter().enumerate().take(seq_len) {
+            if weight == 0.0 {
+                continue;
+            }
+            let base = t * stride;
+            let c_kv = &kv_latent_cache[base..base + kv_lora_rank];
+            axpy_f32(out_h, c_kv, weight);
+        }
+    }
+
+    Ok(())
+}
+
+/// Executes one autoregressive step of a Gated-`DeltaNet` linear-attention recurrent layer (`Qwen3.5`).
+///
+/// Updates the per-head recurrent state matrix `state: [n_heads, head_dim, head_dim]` in place:
+/// `S_h = g_h * S_h + beta_h * (v_h - S_h * k_h) * k_h^T`, then computes `out_h = S_h * q_h`.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `n_heads == 0` or `head_dim == 0` or dimensions overflow.
+/// - Returns [`K3Error::TensorBoundsError`] if buffer lengths mismatch `[n_heads, head_dim]` / `[n_heads]`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recurrent state update takes explicit QKV, decay gate, beta, and geometry parameters"
+)]
+pub fn gated_deltanet_step_f32(
+    state: &mut [f32],
+    out: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    decay_gate: &[f32],
+    beta: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<(), K3Error> {
+    if n_heads == 0 || head_dim == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "qwen35".to_owned(),
+            reason: format!(
+                "gated_deltanet_step_f32 requires non-zero n_heads={n_heads} and head_dim={head_dim}"
+            ),
+        });
+    }
+
+    let expected_vec =
+        n_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "qwen35".to_owned(),
+                reason: "gated_deltanet_step_f32 vector length overflowed usize".to_owned(),
+            })?;
+    let expected_state =
+        expected_vec
+            .checked_mul(head_dim)
+            .ok_or_else(|| K3Error::CapabilityMismatch {
+                architecture: "qwen35".to_owned(),
+                reason: "gated_deltanet_step_f32 state length overflowed usize".to_owned(),
+            })?;
+
+    for (name, actual, expected) in [
+        ("state", state.len(), expected_state),
+        ("out", out.len(), expected_vec),
+        ("q", q.len(), expected_vec),
+        ("k", k.len(), expected_vec),
+        ("v", v.len(), expected_vec),
+        ("decay_gate", decay_gate.len(), n_heads),
+        ("beta", beta.len(), n_heads),
+    ] {
+        if actual != expected {
+            return Err(K3Error::TensorBoundsError {
+                tensor_name: name.to_owned(),
+                offset: 0,
+                byte_len: actual.saturating_mul(size_of::<f32>()),
+                buffer_len: expected.saturating_mul(size_of::<f32>()),
+                reason: format!("Gated-DeltaNet '{name}' length {actual} != expected {expected}"),
+            });
+        }
+    }
+
+    let head_state_len = head_dim * head_dim;
+    for head_idx in 0..n_heads {
+        let decay = decay_gate[head_idx];
+        let gate_beta = beta[head_idx];
+        let q_h = &q[head_idx * head_dim..(head_idx + 1) * head_dim];
+        let k_h = &k[head_idx * head_dim..(head_idx + 1) * head_dim];
+        let v_h = &v[head_idx * head_dim..(head_idx + 1) * head_dim];
+        let out_h = &mut out[head_idx * head_dim..(head_idx + 1) * head_dim];
+        let s_h = &mut state[head_idx * head_state_len..(head_idx + 1) * head_state_len];
+
+        for row_idx in 0..head_dim {
+            let s_row = &mut s_h[row_idx * head_dim..(row_idx + 1) * head_dim];
+            for entry in &mut *s_row {
+                *entry *= decay;
+            }
+            let retrieved = dot_f32(s_row, k_h);
+            let delta = gate_beta * (v_h[row_idx] - retrieved);
+            axpy_f32(s_row, k_h, delta);
+            out_h[row_idx] = dot_f32(s_row, q_h);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,5 +1249,223 @@ mod tests {
         deberta_disentangled_attention_f32(&mut out, &q, &k, &v, &q_pos, &k_pos, &buckets, 2, 1, 2)
             .expect("disentangled attention integration smoke check");
         assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compute_uncompressed_mla_reference(
+        kv_latent_cache: &[f32],
+        key_up_matrix: &[f32],
+        value_up_matrix: &[f32],
+        q_nope_raw: &[f32],
+        q_rotary: &[f32],
+        n_heads: usize,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+        d_nope: usize,
+        d_v: usize,
+        seq_len: usize,
+        scale: f32,
+    ) -> Vec<f32> {
+        let stride = kv_lora_rank + rope_dim;
+        let head_dim_k = d_nope + rope_dim;
+        let mut q_full = vec![0.0_f32; n_heads * head_dim_k];
+        let mut k_full = vec![0.0_f32; seq_len * n_heads * head_dim_k];
+        let mut v_full = vec![0.0_f32; seq_len * n_heads * d_v];
+
+        for h in 0..n_heads {
+            q_full[h * head_dim_k..h * head_dim_k + d_nope]
+                .copy_from_slice(&q_nope_raw[h * d_nope..(h + 1) * d_nope]);
+            q_full[h * head_dim_k + d_nope..(h + 1) * head_dim_k]
+                .copy_from_slice(&q_rotary[h * rope_dim..(h + 1) * rope_dim]);
+
+            for t in 0..seq_len {
+                let c_kv = &kv_latent_cache[t * stride..t * stride + kv_lora_rank];
+                let k_rope = &kv_latent_cache[t * stride + kv_lora_rank..t * stride + stride];
+                let k_dst =
+                    &mut k_full[(t * n_heads + h) * head_dim_k..(t * n_heads + h + 1) * head_dim_k];
+                for (d, slot) in k_dst[..d_nope].iter_mut().enumerate() {
+                    *slot = c_kv
+                        .iter()
+                        .enumerate()
+                        .map(|(r, &c_val)| {
+                            c_val * key_up_matrix[(h * kv_lora_rank + r) * d_nope + d]
+                        })
+                        .sum();
+                }
+                k_dst[d_nope..].copy_from_slice(k_rope);
+
+                let v_dst = &mut v_full[(t * n_heads + h) * d_v..(t * n_heads + h + 1) * d_v];
+                for (vi, slot) in v_dst.iter_mut().enumerate() {
+                    *slot = c_kv
+                        .iter()
+                        .enumerate()
+                        .map(|(r, &c_val)| {
+                            c_val * value_up_matrix[(h * kv_lora_rank + r) * d_v + vi]
+                        })
+                        .sum();
+                }
+            }
+        }
+
+        let mut ref_out = vec![0.0_f32; n_heads * d_v];
+        let mut ref_scores = vec![0.0_f32; seq_len];
+        for h in 0..n_heads {
+            let qh = &q_full[h * head_dim_k..(h + 1) * head_dim_k];
+            for (t, sc) in ref_scores.iter_mut().enumerate() {
+                let kh =
+                    &k_full[(t * n_heads + h) * head_dim_k..(t * n_heads + h + 1) * head_dim_k];
+                *sc = dot_f32(qh, kh) * scale;
+            }
+            softmax_scores_inplace(&mut ref_scores);
+            for (t, &w) in ref_scores.iter().enumerate() {
+                let vh = &v_full[(t * n_heads + h) * d_v..(t * n_heads + h + 1) * d_v];
+                axpy_f32(&mut ref_out[h * d_v..(h + 1) * d_v], vh, w);
+            }
+        }
+        ref_out
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn test_mla_absorbed_attention_equivalence() {
+        let (n_heads, kv_lora_rank, rope_dim, d_nope, d_v, seq_len) = (3, 8, 4, 6, 5, 4);
+        let scale = 1.0_f32 / ((d_nope + rope_dim) as f32).sqrt();
+        let stride = kv_lora_rank + rope_dim;
+        let mut kv_latent_cache = vec![0.0_f32; seq_len * stride];
+        for t in 0..seq_len {
+            for r in 0..kv_lora_rank {
+                kv_latent_cache[t * stride + r] = ((t * 7 + r * 3) % 11) as f32 * 0.1 - 0.5;
+            }
+            for d in 0..rope_dim {
+                kv_latent_cache[t * stride + kv_lora_rank + d] =
+                    ((t * 5 + d * 2) % 9) as f32 * 0.12 - 0.4;
+            }
+        }
+
+        let key_up_matrix: Vec<f32> = (0..n_heads * kv_lora_rank * d_nope)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.08)
+            .collect();
+        let value_up_matrix: Vec<f32> = (0..n_heads * kv_lora_rank * d_v)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.07)
+            .collect();
+        let q_nope_raw: Vec<f32> = (0..n_heads * d_nope)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.15)
+            .collect();
+        let q_rotary: Vec<f32> = (0..n_heads * rope_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.2)
+            .collect();
+
+        let ref_out = compute_uncompressed_mla_reference(
+            &kv_latent_cache,
+            &key_up_matrix,
+            &value_up_matrix,
+            &q_nope_raw,
+            &q_rotary,
+            n_heads,
+            kv_lora_rank,
+            rope_dim,
+            d_nope,
+            d_v,
+            seq_len,
+            scale,
+        );
+
+        let mut q_nope_abs = vec![0.0_f32; n_heads * kv_lora_rank];
+        for h in 0..n_heads {
+            for r in 0..kv_lora_rank {
+                q_nope_abs[h * kv_lora_rank + r] = (0..d_nope)
+                    .map(|d| {
+                        q_nope_raw[h * d_nope + d]
+                            * key_up_matrix[(h * kv_lora_rank + r) * d_nope + d]
+                    })
+                    .sum();
+            }
+        }
+
+        let mut out_latent = vec![0.0_f32; n_heads * kv_lora_rank];
+        mla_absorbed_attention_f32(
+            &mut out_latent,
+            &q_nope_abs,
+            &q_rotary,
+            &kv_latent_cache,
+            n_heads,
+            kv_lora_rank,
+            rope_dim,
+            seq_len,
+            scale,
+        )
+        .expect("mla absorbed attention succeeds");
+
+        let mut abs_out = vec![0.0_f32; n_heads * d_v];
+        for h in 0..n_heads {
+            for vi in 0..d_v {
+                abs_out[h * d_v + vi] = (0..kv_lora_rank)
+                    .map(|r| {
+                        out_latent[h * kv_lora_rank + r]
+                            * value_up_matrix[(h * kv_lora_rank + r) * d_v + vi]
+                    })
+                    .sum();
+            }
+        }
+
+        let max_diff = ref_out
+            .iter()
+            .zip(abs_out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_diff < 1e-5, "max_diff={max_diff}");
+    }
+
+    #[test]
+    fn test_mla_absorbed_attention_error_checks() {
+        let mut out = [0.0_f32; 4];
+        let qn = [0.0_f32; 4];
+        let qr = [0.0_f32; 2];
+        let kv = [0.0_f32; 6];
+        assert!(matches!(
+            mla_absorbed_attention_f32(&mut out, &qn, &qr, &kv, 0, 2, 1, 2, 1.0),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
+        assert!(matches!(
+            mla_absorbed_attention_f32(&mut out[..2], &qn, &qr, &kv, 2, 2, 1, 2, 1.0),
+            Err(K3Error::TensorBoundsError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_gated_deltanet_step_f32() {
+        let n_heads = 2;
+        let head_dim = 3;
+        let mut state = vec![0.0_f32; n_heads * head_dim * head_dim];
+        let mut out = vec![0.0_f32; n_heads * head_dim];
+        let q = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let k = [1.0_f32, 0.0, 0.0, 0.0, 1.0, 0.0];
+        let v = [2.0_f32, 4.0, 6.0, 1.0, 3.0, 5.0];
+        let decay_gate = [0.9_f32, 0.5_f32];
+        let beta = [1.0_f32, 0.5_f32];
+
+        // Step 1 from zero state: S_h = beta_h * v_h * k_h^T, out_h = S_h * q_h = beta_h * v_h
+        gated_deltanet_step_f32(
+            &mut state,
+            &mut out,
+            &q,
+            &k,
+            &v,
+            &decay_gate,
+            &beta,
+            n_heads,
+            head_dim,
+        )
+        .expect("step 1 succeeds");
+        assert!((out[0] - 2.0).abs() < 1e-6);
+        assert!((out[1] - 4.0).abs() < 1e-6);
+        assert!((out[3] - 0.5).abs() < 1e-6);
+        assert!((out[4] - 1.5).abs() < 1e-6);
+
+        // Error checks
+        assert!(matches!(
+            gated_deltanet_step_f32(&mut state, &mut out, &q, &k, &v, &decay_gate, &beta, 0, 3),
+            Err(K3Error::CapabilityMismatch { .. })
+        ));
     }
 }
