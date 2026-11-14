@@ -22,6 +22,7 @@ use crate::quant::{
     read_i2_s_trailer_scale, unpack_i2_s_block_i8,
 };
 use crate::repack::Aligned128;
+pub use crate::repack::{PackedNibbleMatrix, gemm_q4_0_ime, gemm_q4_k_ime};
 
 /// Storage size in bytes of a single `TQ1_0` block (2B FP16 scale + 52B packed base-3 quants).
 pub const TQ1_0_BLOCK_BYTES: usize = 54;
@@ -362,15 +363,41 @@ pub(crate) unsafe fn tile_dot_ime(a: *const i8, b: *const i8, k_chunks: usize, c
     }
 }
 
+/// Returns the active vector register width in bytes (`vlenb` CSR) on `riscv64`, or `0` elsewhere.
+#[must_use]
+#[inline]
+pub fn vlen_bytes() -> usize {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        let vlenb: usize;
+        // SAFETY: reads the read-only `vlenb` CSR without touching memory or vector state.
+        unsafe {
+            core::arch::asm!("csrr {0}, vlenb", out(reg) vlenb, options(nomem, nostack));
+        }
+        vlenb
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        0
+    }
+}
+
+/// Returns `true` when the calling thread executes on an `A100` (`VLEN = 1024`, `vlenb = 128`)
+/// core supporting `XSMTVDotII` (`smt.vpack.vv`, `smt.vmadot`).
+///
+/// Queries the `vlenb` CSR on the calling core so threads migrating across heterogeneous `X100`
+/// (`vlenb = 32`) and `A100` (`vlenb = 128`) clusters never issue `0x6704102b` or `0xe304302b`
+/// on `X100` cores (`SIGILL`-safe).
+#[must_use]
+#[inline]
+pub fn has_ime() -> bool {
+    vlen_bytes() == 128
+}
+
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[inline]
 pub(crate) fn is_vlen_1024() -> bool {
-    let vlenb: usize;
-    // SAFETY: reads the read-only `vlenb` CSR.
-    unsafe {
-        core::arch::asm!("csrr {0}, vlenb", out(reg) vlenb, options(nomem, nostack));
-    }
-    vlenb == 128
+    has_ime()
 }
 
 /// Executes an `XSMTVDotII` probe (`smt.vpack.vv` + `smt.vmadot`) on the calling CPU and reports
