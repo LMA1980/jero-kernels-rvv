@@ -43,23 +43,29 @@ pub use norm::{l2_norm_f32_in_place_rvv, l2_norm_f32_rvv};
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use quant::dequantize_iq4_nl_row_rvv;
 pub use quant::{
-    I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMENTS, I2_S_SCALE_TRAILER_BYTES, IQ4_NL_BLOCK_BYTES,
-    IQ4_NL_BLOCK_ELEMENTS, KVALUES_IQ4NL, Q2_K_BLOCK_BYTES, Q2_K_BLOCK_ELEMENTS, Q3_K_BLOCK_BYTES,
-    Q3_K_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES, Q4_0_BLOCK_ELEMENTS, Q4_1_BLOCK_BYTES,
-    Q4_1_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES, Q5_0_BLOCK_ELEMENTS, Q5_1_BLOCK_BYTES,
-    Q5_1_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES, Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES,
-    Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES, Q8_0_BLOCK_ELEMENTS, dequantize_i2_s_block,
+    BlockQ8_0, BlockQ8K, I2_S_BLOCK_BYTES, I2_S_BLOCK_ELEMENTS, I2_S_SCALE_TRAILER_BYTES,
+    IQ4_NL_BLOCK_BYTES, IQ4_NL_BLOCK_ELEMENTS, KVALUES_IQ4NL, Q2_K_BLOCK_BYTES,
+    Q2_K_BLOCK_ELEMENTS, Q3_K_BLOCK_BYTES, Q3_K_BLOCK_ELEMENTS, Q4_0_BLOCK_BYTES,
+    Q4_0_BLOCK_ELEMENTS, Q4_1_BLOCK_BYTES, Q4_1_BLOCK_ELEMENTS, Q5_0_BLOCK_BYTES,
+    Q5_0_BLOCK_ELEMENTS, Q5_1_BLOCK_BYTES, Q5_1_BLOCK_ELEMENTS, Q5_K_BLOCK_BYTES,
+    Q5_K_BLOCK_ELEMENTS, Q6_K_BLOCK_BYTES, Q6_K_BLOCK_ELEMENTS, Q8_0_BLOCK_BYTES,
+    Q8_0_BLOCK_ELEMENTS, Q8_K_BLOCK_ELEMENTS, dequantize_i2_s_block,
     dequantize_i2_s_row_with_scale, dequantize_iq4_nl_block, dequantize_q2_k_block,
     dequantize_q3_k_block, dequantize_q4_0_block, dequantize_q4_1_block, dequantize_q5_0,
     dequantize_q5_0_block, dequantize_q5_1_block, dequantize_q5_k_block,
     dequantize_q5_k_block_struct, dequantize_q6_k_block, dequantize_q8_0_block,
-    dequantize_row_bytes, dequantize_tensor_row, dequantize_token_row, matvec_q5_k,
-    matvec_q5_k_slice, read_i2_s_trailer_scale, unpack_i2_s_block_i8, unpack_iq4_nl_block_i8,
-    unpack_q2_k_block_i8, unpack_q3_k_block_i8, unpack_q4_1_block_i8, unpack_q5_0_block_i8,
-    unpack_q5_1_block_i8, validate_q5_k_dimensions, vec_dot_bf16, vec_dot_bf16_scalar, vec_dot_f16,
-    vec_dot_f16_scalar, vec_dot_i2_s, vec_dot_iq4_nl, vec_dot_q2_k, vec_dot_q3_k, vec_dot_q4_0,
-    vec_dot_q4_0_scalar, vec_dot_q4_1, vec_dot_q5_0, vec_dot_q5_0_q8_0, vec_dot_q5_1, vec_dot_q5_k,
-    vec_dot_q5_k_scalar, vec_dot_q6_k, vec_dot_q6_k_scalar, vec_dot_q8_0, vec_dot_q8_0_scalar,
+    dequantize_row_bytes, dequantize_tensor_row, dequantize_token_row, gemv_q4_0_q8_0,
+    gemv_q4_0_q8_0_4x, gemv_q4_k_q8_k, gemv_q5_0_q8_0, gemv_q5_0_q8_0_4x, gemv_q5_k_q8_k,
+    gemv_q6_k_q8_k, gemv_q8_0_q8_0, gemv_q8_0_q8_0_4x, gemv_tq1_0_q8_k, gemv_tq2_0_q8_k,
+    matvec_q5_k, matvec_q5_k_slice, quantize_row_q8_0, quantize_row_q8_0_f32, quantize_row_q8_k,
+    read_i2_s_trailer_scale, unpack_i2_s_block_i8, unpack_iq4_nl_block_i8, unpack_q2_k_block_i8,
+    unpack_q3_k_block_i8, unpack_q4_1_block_i8, unpack_q5_0_block_i8, unpack_q5_1_block_i8,
+    validate_q5_k_dimensions, vec_dot_bf16, vec_dot_bf16_scalar, vec_dot_f16, vec_dot_f16_scalar,
+    vec_dot_i2_s, vec_dot_iq4_nl, vec_dot_q2_k, vec_dot_q3_k, vec_dot_q4_0, vec_dot_q4_0_q8_0,
+    vec_dot_q4_0_scalar, vec_dot_q4_1, vec_dot_q4_k_q8_k, vec_dot_q5_0, vec_dot_q5_0_q8_0,
+    vec_dot_q5_0_q8_0_blocks, vec_dot_q5_1, vec_dot_q5_k, vec_dot_q5_k_q8_k, vec_dot_q5_k_scalar,
+    vec_dot_q6_k, vec_dot_q6_k_q8_k, vec_dot_q6_k_scalar, vec_dot_q8_0, vec_dot_q8_0_q8_0,
+    vec_dot_q8_0_scalar, vec_dot_tq1_0_q8_k, vec_dot_tq2_0_q8_k,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use quant::{
@@ -91,8 +97,11 @@ pub use rope::{
     compute_rope_cos_sin, precompute_rope_inv_freq,
 };
 pub use ssm::{
-    lfm2_shortconv_step_f32, mamba2_conv1d_silu_step, mamba2_ssd_state_step_f32,
-    rwkv_token_shift_lerp_f32, rwkv7_wkv_delta_rule_step_f32, silu_scalar_f32, softplus_f32,
+    lfm2_shortconv_step_f32, mamba2_conv1d_silu_chunk_f32, mamba2_conv1d_silu_step,
+    mamba2_ssd_chunk_scan_f32, mamba2_ssd_intra_chunk_ime_i8, mamba2_ssd_state_step_f32,
+    rwkv_token_shift_lerp_f32, rwkv_token_shift_lerp_sequence_f32,
+    rwkv7_wkv_delta_rule_sequence_f32, rwkv7_wkv_delta_rule_step_f32, silu_scalar_f32,
+    softplus_f32,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use swiglu::swiglu_f32_rvv;
@@ -219,6 +228,10 @@ pub trait VectorKernel: Send + Sync + std::fmt::Debug {
         sin: &[f32],
     ) -> Result<(), K3Error> {
         apply_rope_with_cos_sin(x, num_heads, head_dim, rotary_dim, rope_type, cos, sin)
+    }
+
+    fn argmax_f32(&self, logits: &[f32]) -> Option<usize> {
+        argmax_f32(logits)
     }
 }
 
@@ -357,6 +370,131 @@ impl VectorKernel for BaselineKernel {
         sin: &[f32],
     ) -> Result<(), K3Error> {
         apply_rope_with_cos_sin(x, num_heads, head_dim, rotary_dim, rope_type, cos, sin)
+    }
+
+    fn argmax_f32(&self, logits: &[f32]) -> Option<usize> {
+        argmax_f32(logits)
+    }
+}
+
+/// Returns the deterministic lowest index of the maximum non-`NaN` element in `logits` using
+/// portable scalar scan (`None` when `logits` is empty or all `NaN`).
+#[must_use]
+pub fn argmax_f32_scalar(logits: &[f32]) -> Option<usize> {
+    let mut best_idx: Option<usize> = None;
+    let mut best_val = f32::NEG_INFINITY;
+    for (idx, &val) in logits.iter().enumerate() {
+        if val.is_nan() {
+            continue;
+        }
+        if best_idx.is_none() || val > best_val {
+            best_val = val;
+            best_idx = Some(idx);
+        }
+    }
+    best_idx
+}
+
+/// Returns the deterministic lowest index of the maximum non-`NaN` element in `logits` using VLA
+/// RVV 1.0 (`vfredmax.vs` + `vmfeq.vf` + `vfirst.m`), returning `None` for empty or all-`NaN` slices.
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[must_use]
+pub fn argmax_f32_rvv(logits: &[f32]) -> Option<usize> {
+    if logits.is_empty() {
+        return None;
+    }
+
+    let neg_inf = f32::NEG_INFINITY;
+    let ptr = logits.as_ptr();
+    let rem = logits.len();
+    let max_val: f32;
+    // SAFETY: `logits` has `rem` readable `f32` elements; Pass 1 scans VLA `e32, m2` (`LMUL <= m2`,
+    // `VLEN >= 128`-safe) masking non-NaN lanes via `vmfeq.vv` before `vfredmax.vs`.
+    unsafe {
+        core::arch::asm!(
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.v.f v24, {ninf}",
+            "2:",
+            "vsetvli {vl}, {rem}, e32, m2, ta, ma",
+            "vle32.v v8, ({px})",
+            "vmfeq.vv v0, v8, v8",
+            "vfredmax.vs v24, v8, v24, v0.t",
+            "slli t0, {vl}, 2",
+            "add {px}, {px}, t0",
+            "sub {rem}, {rem}, {vl}",
+            "bnez {rem}, 2b",
+            "vsetivli zero, 1, e32, m1, ta, ma",
+            "vfmv.f.s {maxv}, v24",
+            px = inout(reg) ptr => _,
+            rem = inout(reg) rem => _,
+            ninf = in(freg) neg_inf,
+            maxv = out(freg) max_val,
+            vl = out(reg) _,
+            out("t0") _,
+            out("v0") _,
+            out("v8") _,
+            out("v9") _,
+            out("v24") _,
+            options(nostack, readonly),
+        );
+    }
+
+    let ptr2 = logits.as_ptr();
+    let rem2 = logits.len();
+    let base_idx = 0_usize;
+    let found_idx: isize;
+    // SAFETY: `logits` has `rem2` readable `f32` elements; Pass 2 finds the lowest index matching
+    // `max_val` via `vmfeq.vf` + `vfirst.m`. If all elements are `NaN`, `max_val` stays `-Inf`
+    // and `vmfeq.vf` matches zero elements so `found_idx == -1`.
+    unsafe {
+        core::arch::asm!(
+            "li {found}, -1",
+            "2:",
+            "vsetvli {vl}, {rem}, e32, m2, ta, ma",
+            "vle32.v v8, ({px})",
+            "vmfeq.vf v0, v8, {maxv}",
+            "vfirst.m t1, v0",
+            "bgez t1, 3f",
+            "slli t0, {vl}, 2",
+            "add {px}, {px}, t0",
+            "add {base}, {base}, {vl}",
+            "sub {rem}, {rem}, {vl}",
+            "bnez {rem}, 2b",
+            "j 4f",
+            "3:",
+            "add {found}, {base}, t1",
+            "4:",
+            px = inout(reg) ptr2 => _,
+            rem = inout(reg) rem2 => _,
+            base = inout(reg) base_idx => _,
+            maxv = in(freg) max_val,
+            found = out(reg) found_idx,
+            vl = out(reg) _,
+            out("t0") _,
+            out("t1") _,
+            out("v0") _,
+            out("v8") _,
+            out("v9") _,
+            options(nostack, readonly),
+        );
+    }
+
+    usize::try_from(found_idx).ok()
+}
+
+/// Returns the deterministic lowest index of the maximum non-`NaN` logit, or `None` when `logits`
+/// is empty or contains only `NaN` values.
+///
+/// Dispatches to `argmax_f32_rvv` on `riscv64` targets and [`argmax_f32_scalar`] elsewhere.
+#[must_use]
+pub fn argmax_f32(logits: &[f32]) -> Option<usize> {
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    {
+        argmax_f32_rvv(logits)
+    }
+    #[cfg(any(not(target_arch = "riscv64"), miri))]
+    {
+        argmax_f32_scalar(logits)
     }
 }
 
@@ -713,13 +851,13 @@ pub fn rmsnorm_rvv(
 /// # Mathematical Formulation
 ///
 /// 1. Computes `RMSNorm`:
-///    $$x_{norm}[i] = \frac{input[i]}{\sqrt{\frac{1}{N} \sum_{j=0}^{N-1} input[j]^2 + \epsilon}} \times norm\_weight[i]$$
+///    `x_norm[i] = (input[i] / sqrt(mean(input^2) + eps)) * norm_weight[i]`
 /// 2. Determines dynamic per-token absolute maximum:
-///    $$max\_val = \max_{i} |x_{norm}[i]|$$
+///    `max_val = max_i |x_norm[i]|`
 /// 3. Computes dequantization scale:
-///    $$scale = \frac{max\_val}{127.0}$$
+///    `scale = max_val / 127.0`
 /// 4. Quantizes symmetrically to `i8`:
-///    $$out\_i8[i] = \text{round}\left(\frac{x_{norm}[i]}{scale}\right).\text{clamp}(-128.0, 127.0) \text{ as } i8$$
+///    `out_i8[i] = round(x_norm[i] / scale).clamp(-128.0, 127.0) as i8`
 ///
 /// # Safety and Numerical Stability
 ///
@@ -790,7 +928,7 @@ pub fn subln_quantize_absmax_i8(
     Ok(scale)
 }
 
-/// Computes the gated $\text{ReLU}^2$ activation: $out[i] = (\max(0.0, gate[i]))^2 \times up[i]$.
+/// Computes the gated $\text{ReLU}^2$ activation: `out[i] = max(0.0, gate[i])^2 * up[i]`.
 ///
 /// Used in `bitnet-b1.58-2B-4T` feed-forward networks (FFN) to provide strong non-linear gating
 /// while maintaining sparsity.
@@ -882,7 +1020,7 @@ pub fn relu_squared_gate_rvv(out: &mut [f32], gate: &[f32], up: &[f32]) {
     }
 }
 
-fn validate_q4_k_m_dimensions(
+pub(crate) fn validate_q4_k_m_dimensions(
     output_len: usize,
     weights: &TensorView<'_>,
     input_len: usize,
@@ -992,8 +1130,8 @@ pub fn vec_dot_q4_k_m_scalar(
     Ok(())
 }
 
-/// Computes matrix-vector multiplication with `Q4_K_M` quantized weights using `Q4_K_M` block
-/// dequantization paired with VLA RVV 1.0 vector dot product (`dot_product_f32_rvv`).
+/// Computes matrix-vector multiplication with `Q4_K_M` quantized weights using 4-row RVV integer
+/// `Q4_K_M x Q8_K` GEMV over stack-chunked `BlockQ8K` activations (zero heap allocations).
 ///
 /// # Errors
 ///
@@ -1005,36 +1143,7 @@ pub fn vec_dot_q4_k_m_rvv(
     weights: &TensorView<'_>,
     input: &[f32],
 ) -> Result<(), K3Error> {
-    let (rows, cols) = validate_q4_k_m_dimensions(output.len(), weights, input.len())?;
-    let blocks_per_row = cols / Q4_K_M_BLOCK_ELEMENTS;
-    let raw_bytes = weights.as_bytes();
-    let mut dequant_buf = [0.0_f32; Q4_K_M_BLOCK_ELEMENTS];
-
-    for (row, out_slot) in output.iter_mut().enumerate().take(rows) {
-        let mut row_sum = 0.0_f32;
-        for blk_idx in 0..blocks_per_row {
-            let block_index = row * blocks_per_row + blk_idx;
-            let byte_start = block_index * Q4_K_M_BLOCK_BYTES;
-            let byte_end = byte_start + Q4_K_M_BLOCK_BYTES;
-            let block_slice: &[u8; Q4_K_M_BLOCK_BYTES] = raw_bytes[byte_start..byte_end]
-                .try_into()
-                .map_err(|_| K3Error::TensorBoundsError {
-                    tensor_name: weights.name().to_owned(),
-                    offset: byte_start,
-                    byte_len: Q4_K_M_BLOCK_BYTES,
-                    buffer_len: raw_bytes.len(),
-                    reason: "failed to slice Q4_K_M block".to_owned(),
-                })?;
-
-            dequantize_q4_k_m_block(block_slice, &mut dequant_buf);
-            let input_sub =
-                &input[blk_idx * Q4_K_M_BLOCK_ELEMENTS..(blk_idx + 1) * Q4_K_M_BLOCK_ELEMENTS];
-            row_sum += dot_product_f32_rvv(&dequant_buf, input_sub);
-        }
-        *out_slot = row_sum;
-    }
-
-    Ok(())
+    quant::vec_dot_q4_k_m_4row_rvv(output, weights, input)
 }
 
 #[cfg(test)]
@@ -1112,5 +1221,24 @@ mod tests {
 
         assert!(output[0] > 0.0);
         assert!(output[1] > output[0]);
+    }
+
+    #[test]
+    fn test_argmax_f32_edge_cases_and_trait_dispatch() {
+        assert_eq!(argmax_f32(&[]), None);
+        assert_eq!(argmax_f32(&[f32::NAN, f32::NAN, f32::NAN]), None);
+        assert_eq!(argmax_f32(&[f32::NEG_INFINITY, f32::NAN]), Some(0));
+        assert_eq!(argmax_f32(&[-0.0_f32, 0.0_f32, -0.0_f32]), Some(0));
+        // Lowest index wins on ties, NaNs skipped anywhere in long (>16) VLA slice.
+        let mut logits = [1.5_f32; 37];
+        logits[0] = f32::NAN;
+        logits[5] = 42.25;
+        logits[19] = f32::NAN;
+        logits[23] = 42.25;
+        logits[36] = 42.0;
+        assert_eq!(argmax_f32(&logits), Some(5));
+        assert_eq!(argmax_f32_scalar(&logits), Some(5));
+        assert_eq!(BaselineKernel::new().argmax_f32(&logits), Some(5));
+        assert_eq!(RvvKernel::new().argmax_f32(&logits), Some(5));
     }
 }

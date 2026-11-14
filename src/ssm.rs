@@ -408,10 +408,6 @@ fn rwkv_token_shift_lerp_f32_rvv(prev_x: &[f32], cur_x: &[f32], mu: &[f32], out:
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[inline]
 #[allow(unused_assignments)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "RWKV7 row update passes disjoint state/weight/key slices and scalar multipliers"
-)]
 fn rwkv7_state_row_update_rvv(
     s_row: &mut [f32],
     w_h: &[f32],
@@ -633,6 +629,482 @@ pub fn lfm2_shortconv_step_f32(
     Ok(())
 }
 
+#[inline]
+fn checked_ssm_dim(op: &str, dim: usize, name: &str) -> Result<usize, K3Error> {
+    if dim == 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "mamba2/rwkv7".to_owned(),
+            reason: format!("{op} requires non-zero {name}"),
+        });
+    }
+    Ok(dim)
+}
+
+#[inline]
+fn checked_ssm_mul(op: &str, a: usize, b: usize) -> Result<usize, K3Error> {
+    a.checked_mul(b).ok_or_else(|| K3Error::CapabilityMismatch {
+        architecture: "mamba2/rwkv7".to_owned(),
+        reason: format!("{op}: {a} * {b} overflowed usize"),
+    })
+}
+
+#[inline]
+fn check_ssm_slice_len(op: &str, got: usize, expected: usize) -> Result<(), K3Error> {
+    if got != expected {
+        return Err(K3Error::TensorBoundsError {
+            tensor_name: op.to_owned(),
+            offset: 0,
+            byte_len: got,
+            buffer_len: expected,
+            reason: format!("{op} expected {expected} elements, got {got}"),
+        });
+    }
+    Ok(())
+}
+
+#[inline]
+fn row_max_abs_f32(slice: &[f32]) -> f32 {
+    let mut max_abs = 0.0_f32;
+    for &v in slice {
+        let a = v.abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    max_abs
+}
+
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn quantize_f32_to_i8_tile(src: &[f32], inv_scale: f32, dst: &mut [i8]) {
+    for (d, &v) in dst.iter_mut().zip(src.iter()) {
+        let q = (v * inv_scale).round().clamp(-127.0_f32, 127.0_f32);
+        *d = q as i8;
+    }
+}
+
+/// Executes a prefill chunk of `Mamba2` causal depthwise `Conv1D + SiLU` over `[seq_len, channels]`.
+///
+/// Updates `conv_state` (`[channels, kernel_size - 1]`) in place across all `seq_len` steps with
+/// zero heap allocations.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `seq_len`, `channels`, or `kernel_size` is zero or overflows.
+/// - Returns [`K3Error::TensorBoundsError`] if slice lengths mismatch the configured dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_conv1d_silu_chunk_f32(
+    conv_state: &mut [f32],
+    x_seq: &[f32],
+    conv_weight: &[f32],
+    conv_bias: Option<&[f32]>,
+    out_seq: &mut [f32],
+    seq_len: usize,
+    channels: usize,
+    kernel_size: usize,
+) -> Result<(), K3Error> {
+    const OP: &str = "mamba2_conv1d_silu_chunk_f32";
+    let seq_len = checked_ssm_dim(OP, seq_len, "seq_len")?;
+    let channels = checked_ssm_dim(OP, channels, "channels")?;
+    let kernel_size = checked_ssm_dim(OP, kernel_size, "kernel_size")?;
+    let state_len = checked_ssm_mul(OP, channels, kernel_size - 1)?;
+    let weight_len = checked_ssm_mul(OP, channels, kernel_size)?;
+    let seq_elems = checked_ssm_mul(OP, seq_len, channels)?;
+
+    check_ssm_slice_len(
+        "mamba2_conv1d_silu_chunk_f32:conv_state",
+        conv_state.len(),
+        state_len,
+    )?;
+    check_ssm_slice_len("mamba2_conv1d_silu_chunk_f32:x_seq", x_seq.len(), seq_elems)?;
+    check_ssm_slice_len(
+        "mamba2_conv1d_silu_chunk_f32:conv_weight",
+        conv_weight.len(),
+        weight_len,
+    )?;
+    check_ssm_slice_len(
+        "mamba2_conv1d_silu_chunk_f32:out_seq",
+        out_seq.len(),
+        seq_elems,
+    )?;
+    if let Some(bias) = conv_bias {
+        check_ssm_slice_len(
+            "mamba2_conv1d_silu_chunk_f32:conv_bias",
+            bias.len(),
+            channels,
+        )?;
+    }
+
+    for t in 0..seq_len {
+        let off = t * channels;
+        mamba2_conv1d_silu_step(
+            conv_state,
+            &x_seq[off..off + channels],
+            conv_weight,
+            conv_bias,
+            &mut out_seq[off..off + channels],
+            channels,
+            kernel_size,
+        )?;
+    }
+    Ok(())
+}
+
+/// Computes causal lower-triangular `Mamba2` intra-chunk `C · B^T` projection scores using `i8` dot products.
+///
+/// For each group `g` in `0..n_groups` and positions `0 <= i, j < chunk_len`:
+/// - `out_scores[g, i, j] = dot(C[i, g, :], B[j, g, :])` when `j <= i` (quantized per row to `i8` and
+///   evaluated via [`crate::ime::dot_i8_vector`] in stack-allocated `[i8; 256]` tiles).
+/// - `out_scores[g, i, j] = 0.0` when `j > i` (strictly causal).
+///
+/// Operates with zero heap allocations.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `chunk_len`, `n_groups`, or `state_size` is zero or overflows.
+/// - Returns [`K3Error::TensorBoundsError`] if `c_chunk`, `b_chunk`, or `out_scores` lengths mismatch.
+pub fn mamba2_ssd_intra_chunk_ime_i8(
+    c_chunk: &[f32],
+    b_chunk: &[f32],
+    out_scores: &mut [f32],
+    chunk_len: usize,
+    n_groups: usize,
+    state_size: usize,
+) -> Result<(), K3Error> {
+    const OP: &str = "mamba2_ssd_intra_chunk_ime_i8";
+    const K_TILE: usize = 256;
+
+    let chunk_len = checked_ssm_dim(OP, chunk_len, "chunk_len")?;
+    let n_groups = checked_ssm_dim(OP, n_groups, "n_groups")?;
+    let state_size = checked_ssm_dim(OP, state_size, "state_size")?;
+
+    let group_step_elems = checked_ssm_mul(OP, n_groups, state_size)?;
+    let cb_elems = checked_ssm_mul(OP, chunk_len, group_step_elems)?;
+    let sq_elems = checked_ssm_mul(OP, chunk_len, chunk_len)?;
+    let out_elems = checked_ssm_mul(OP, n_groups, sq_elems)?;
+
+    check_ssm_slice_len(
+        "mamba2_ssd_intra_chunk_ime_i8:c_chunk",
+        c_chunk.len(),
+        cb_elems,
+    )?;
+    check_ssm_slice_len(
+        "mamba2_ssd_intra_chunk_ime_i8:b_chunk",
+        b_chunk.len(),
+        cb_elems,
+    )?;
+    check_ssm_slice_len(
+        "mamba2_ssd_intra_chunk_ime_i8:out_scores",
+        out_scores.len(),
+        out_elems,
+    )?;
+
+    out_scores.fill(0.0_f32);
+    let mut c_tile = [0_i8; K_TILE];
+    let mut b_tile = [0_i8; K_TILE];
+
+    for g in 0..n_groups {
+        let out_g = &mut out_scores[g * sq_elems..(g + 1) * sq_elems];
+        for i in 0..chunk_len {
+            let c_off = i * group_step_elems + g * state_size;
+            let c_row = &c_chunk[c_off..c_off + state_size];
+            let c_max = row_max_abs_f32(c_row);
+            if c_max == 0.0_f32 {
+                continue;
+            }
+            let c_scale = c_max / 127.0_f32;
+            let c_inv = 127.0_f32 / c_max;
+
+            for j in 0..=i {
+                let b_off = j * group_step_elems + g * state_size;
+                let b_row = &b_chunk[b_off..b_off + state_size];
+                let b_max = row_max_abs_f32(b_row);
+                if b_max == 0.0_f32 {
+                    continue;
+                }
+                let b_scale = b_max / 127.0_f32;
+                let b_inv = 127.0_f32 / b_max;
+
+                let mut acc_i64 = 0_i64;
+                let mut k = 0_usize;
+                while k < state_size {
+                    let len = (state_size - k).min(K_TILE);
+                    quantize_f32_to_i8_tile(&c_row[k..k + len], c_inv, &mut c_tile[..len]);
+                    quantize_f32_to_i8_tile(&b_row[k..k + len], b_inv, &mut b_tile[..len]);
+                    acc_i64 += i64::from(crate::ime::dot_i8_vector(&c_tile[..len], &b_tile[..len]));
+                    k += len;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    out_g[i * chunk_len + j] = (acc_i64 as f32) * (c_scale * b_scale);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Executes a prefill chunk scan of `Mamba2` Structured State-Space Duality (`SSD`) over `seq_len` steps.
+///
+/// Updates `state` (`[n_heads, head_dim, state_size]`) in place using `F32` exponential decay and
+/// RVV/scalar vector accumulation via [`mamba2_ssd_state_step_f32`] with zero heap allocations.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if any dimension is zero, `n_heads` is not divisible by
+///   `n_groups`, or lengths overflow.
+/// - Returns [`K3Error::TensorBoundsError`] if any slice length mismatches the configured dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn mamba2_ssd_chunk_scan_f32(
+    state: &mut [f32],
+    out_seq: &mut [f32],
+    x_seq: &[f32],
+    dt_raw_seq: &[f32],
+    dt_bias: Option<&[f32]>,
+    a_log_or_neg: &[f32],
+    b_seq: &[f32],
+    c_seq: &[f32],
+    d_skip: Option<&[f32]>,
+    z_gate_seq: Option<&[f32]>,
+    seq_len: usize,
+    n_heads: usize,
+    head_dim: usize,
+    state_size: usize,
+    n_groups: usize,
+) -> Result<(), K3Error> {
+    const OP: &str = "mamba2_ssd_chunk_scan_f32";
+    let seq_len = checked_ssm_dim(OP, seq_len, "seq_len")?;
+    let n_heads = checked_ssm_dim(OP, n_heads, "n_heads")?;
+    let head_dim = checked_ssm_dim(OP, head_dim, "head_dim")?;
+    let state_size = checked_ssm_dim(OP, state_size, "state_size")?;
+    let n_groups = checked_ssm_dim(OP, n_groups, "n_groups")?;
+    if n_heads % n_groups != 0 {
+        return Err(K3Error::CapabilityMismatch {
+            architecture: "mamba2".to_owned(),
+            reason: format!("{OP}: n_heads ({n_heads}) must be divisible by n_groups ({n_groups})"),
+        });
+    }
+
+    let d_inner = checked_ssm_mul(OP, n_heads, head_dim)?;
+    let state_len = checked_ssm_mul(OP, d_inner, state_size)?;
+    let group_state = checked_ssm_mul(OP, n_groups, state_size)?;
+    let seq_d_inner = checked_ssm_mul(OP, seq_len, d_inner)?;
+    let seq_heads = checked_ssm_mul(OP, seq_len, n_heads)?;
+    let seq_group_state = checked_ssm_mul(OP, seq_len, group_state)?;
+
+    check_ssm_slice_len("mamba2_ssd_chunk_scan_f32:state", state.len(), state_len)?;
+    check_ssm_slice_len(
+        "mamba2_ssd_chunk_scan_f32:out_seq",
+        out_seq.len(),
+        seq_d_inner,
+    )?;
+    check_ssm_slice_len("mamba2_ssd_chunk_scan_f32:x_seq", x_seq.len(), seq_d_inner)?;
+    check_ssm_slice_len(
+        "mamba2_ssd_chunk_scan_f32:dt_raw_seq",
+        dt_raw_seq.len(),
+        seq_heads,
+    )?;
+    check_ssm_slice_len(
+        "mamba2_ssd_chunk_scan_f32:a_log_or_neg",
+        a_log_or_neg.len(),
+        n_heads,
+    )?;
+    check_ssm_slice_len(
+        "mamba2_ssd_chunk_scan_f32:b_seq",
+        b_seq.len(),
+        seq_group_state,
+    )?;
+    check_ssm_slice_len(
+        "mamba2_ssd_chunk_scan_f32:c_seq",
+        c_seq.len(),
+        seq_group_state,
+    )?;
+    if let Some(bias) = dt_bias {
+        check_ssm_slice_len("mamba2_ssd_chunk_scan_f32:dt_bias", bias.len(), n_heads)?;
+    }
+    if let Some(skip) = d_skip {
+        check_ssm_slice_len("mamba2_ssd_chunk_scan_f32:d_skip", skip.len(), n_heads)?;
+    }
+    if let Some(z_seq) = z_gate_seq {
+        check_ssm_slice_len(
+            "mamba2_ssd_chunk_scan_f32:z_gate_seq",
+            z_seq.len(),
+            seq_d_inner,
+        )?;
+    }
+
+    for t in 0..seq_len {
+        let d_off = t * d_inner;
+        let h_off = t * n_heads;
+        let g_off = t * group_state;
+        let z_step = z_gate_seq.map(|z| &z[d_off..d_off + d_inner]);
+        mamba2_ssd_state_step_f32(
+            state,
+            &mut out_seq[d_off..d_off + d_inner],
+            &x_seq[d_off..d_off + d_inner],
+            &dt_raw_seq[h_off..h_off + n_heads],
+            dt_bias,
+            a_log_or_neg,
+            &b_seq[g_off..g_off + group_state],
+            &c_seq[g_off..g_off + group_state],
+            d_skip,
+            z_step,
+            n_heads,
+            head_dim,
+            state_size,
+            n_groups,
+        )?;
+    }
+    Ok(())
+}
+
+/// Computes `RWKV-7` token-shift linear interpolation (`x_shifted = cur_x + mu * (prev_x - cur_x)`)
+/// across a sequence `[seq_len, dim]` and updates `prev_x` to the final sequence token.
+///
+/// Operates with zero heap allocations.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `seq_len` or `dim` is zero or overflows.
+/// - Returns [`K3Error::TensorBoundsError`] if slice lengths mismatch the configured dimensions.
+pub fn rwkv_token_shift_lerp_sequence_f32(
+    prev_x: &mut [f32],
+    x_seq: &[f32],
+    mu: &[f32],
+    out_seq: &mut [f32],
+    seq_len: usize,
+    dim: usize,
+) -> Result<(), K3Error> {
+    const OP: &str = "rwkv_token_shift_lerp_sequence_f32";
+    let seq_len = checked_ssm_dim(OP, seq_len, "seq_len")?;
+    let dim = checked_ssm_dim(OP, dim, "dim")?;
+    let total = checked_ssm_mul(OP, seq_len, dim)?;
+
+    check_ssm_slice_len(
+        "rwkv_token_shift_lerp_sequence_f32:prev_x",
+        prev_x.len(),
+        dim,
+    )?;
+    check_ssm_slice_len(
+        "rwkv_token_shift_lerp_sequence_f32:x_seq",
+        x_seq.len(),
+        total,
+    )?;
+    check_ssm_slice_len("rwkv_token_shift_lerp_sequence_f32:mu", mu.len(), dim)?;
+    check_ssm_slice_len(
+        "rwkv_token_shift_lerp_sequence_f32:out_seq",
+        out_seq.len(),
+        total,
+    )?;
+
+    rwkv_token_shift_lerp_f32(prev_x, &x_seq[..dim], mu, &mut out_seq[..dim])?;
+    for t in 1..seq_len {
+        let prev_off = (t - 1) * dim;
+        let cur_off = t * dim;
+        rwkv_token_shift_lerp_f32(
+            &x_seq[prev_off..prev_off + dim],
+            &x_seq[cur_off..cur_off + dim],
+            mu,
+            &mut out_seq[cur_off..cur_off + dim],
+        )?;
+    }
+    let last_off = (seq_len - 1) * dim;
+    prev_x.copy_from_slice(&x_seq[last_off..last_off + dim]);
+    Ok(())
+}
+
+/// Executes a sequence scan of the `RWKV-7` (`Goose`) generalized delta-rule `WKV` update.
+///
+/// Updates `state` (`[n_heads, head_size, head_size]`) in place across `seq_len` steps via
+/// [`rwkv7_wkv_delta_rule_step_f32`] with zero heap allocations.
+///
+/// # Errors
+///
+/// - Returns [`K3Error::CapabilityMismatch`] if `seq_len`, `n_heads`, or `head_size` is zero or overflows.
+/// - Returns [`K3Error::TensorBoundsError`] if slice lengths mismatch the configured dimensions.
+#[allow(clippy::too_many_arguments)]
+pub fn rwkv7_wkv_delta_rule_sequence_f32(
+    state: &mut [f32],
+    out_seq: &mut [f32],
+    r_seq: &[f32],
+    w_decay_seq: &[f32],
+    k_seq: &[f32],
+    v_seq: &[f32],
+    a_seq: &[f32],
+    b_seq: &[f32],
+    seq_len: usize,
+    n_heads: usize,
+    head_size: usize,
+) -> Result<(), K3Error> {
+    const OP: &str = "rwkv7_wkv_delta_rule_sequence_f32";
+    let seq_len = checked_ssm_dim(OP, seq_len, "seq_len")?;
+    let n_heads = checked_ssm_dim(OP, n_heads, "n_heads")?;
+    let head_size = checked_ssm_dim(OP, head_size, "head_size")?;
+    let step_dim = checked_ssm_mul(OP, n_heads, head_size)?;
+    let head_sq = checked_ssm_mul(OP, head_size, head_size)?;
+    let state_len = checked_ssm_mul(OP, n_heads, head_sq)?;
+    let seq_elems = checked_ssm_mul(OP, seq_len, step_dim)?;
+
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:state",
+        state.len(),
+        state_len,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:out_seq",
+        out_seq.len(),
+        seq_elems,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:r_seq",
+        r_seq.len(),
+        seq_elems,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:w_decay_seq",
+        w_decay_seq.len(),
+        seq_elems,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:k_seq",
+        k_seq.len(),
+        seq_elems,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:v_seq",
+        v_seq.len(),
+        seq_elems,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:a_seq",
+        a_seq.len(),
+        seq_elems,
+    )?;
+    check_ssm_slice_len(
+        "rwkv7_wkv_delta_rule_sequence_f32:b_seq",
+        b_seq.len(),
+        seq_elems,
+    )?;
+
+    for t in 0..seq_len {
+        let off = t * step_dim;
+        rwkv7_wkv_delta_rule_step_f32(
+            state,
+            &mut out_seq[off..off + step_dim],
+            &r_seq[off..off + step_dim],
+            &w_decay_seq[off..off + step_dim],
+            &k_seq[off..off + step_dim],
+            &v_seq[off..off + step_dim],
+            &a_seq[off..off + step_dim],
+            &b_seq[off..off + step_dim],
+            n_heads,
+            head_size,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,5 +1300,268 @@ mod tests {
         assert!((sc_out[0] - 1.0).abs() < 1e-6);
         assert!((sc_out[1] - 0.5).abs() < 1e-6);
         assert_eq!(sc_state, vec![1.0, 0.5, 0.25, -0.5]);
+    }
+
+    #[test]
+    fn test_mamba2_conv1d_chunk_matches_step_by_step() {
+        let channels = 4;
+        let kernel_size = 3;
+        let seq_len = 5;
+        let init_conv = vec![0.1_f32, -0.2, 0.3, 0.0, -0.4, 0.25, 0.15, -0.1];
+        let x_seq: Vec<f32> = (0..seq_len * channels)
+            .map(|i| (f32::from(u8::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.15)
+            .collect();
+        let w_conv = vec![0.5_f32; channels * kernel_size];
+        let b_conv = vec![0.05_f32; channels];
+
+        let mut step_conv_state = init_conv.clone();
+        let mut step_conv_out = vec![0.0_f32; seq_len * channels];
+        for t in 0..seq_len {
+            let off = t * channels;
+            mamba2_conv1d_silu_step(
+                &mut step_conv_state,
+                &x_seq[off..off + channels],
+                &w_conv,
+                Some(&b_conv),
+                &mut step_conv_out[off..off + channels],
+                channels,
+                kernel_size,
+            )
+            .expect("conv1d step");
+        }
+        let mut chunk_conv_state = init_conv;
+        let mut chunk_conv_out = vec![0.0_f32; seq_len * channels];
+        mamba2_conv1d_silu_chunk_f32(
+            &mut chunk_conv_state,
+            &x_seq,
+            &w_conv,
+            Some(&b_conv),
+            &mut chunk_conv_out,
+            seq_len,
+            channels,
+            kernel_size,
+        )
+        .expect("conv1d chunk");
+        for (got, expected) in chunk_conv_out.iter().zip(step_conv_out.iter()) {
+            assert!((got - expected).abs() < 1e-6);
+        }
+        assert_eq!(step_conv_state, chunk_conv_state);
+    }
+
+    #[test]
+    fn test_mamba2_ssd_chunk_scan_matches_step_by_step_and_rejects_bad_groups() {
+        let (seq_len, n_heads, head_dim, state_size, n_groups) = (5, 4, 2, 4, 2);
+        let init_ssd = vec![0.05_f32; n_heads * head_dim * state_size];
+        let dt_seq = vec![0.2_f32; seq_len * n_heads];
+        let dt_bias = vec![0.05_f32; n_heads];
+        let a_neg = vec![0.4_f32; n_heads];
+        let b_seq: Vec<f32> = (0..seq_len * n_groups * state_size)
+            .map(|i| (f32::from(u8::try_from(i % 11).unwrap_or(0)) - 5.0) * 0.2)
+            .collect();
+        let c_seq: Vec<f32> = (0..seq_len * n_groups * state_size)
+            .map(|i| (f32::from(u8::try_from((i * 3 + 1) % 11).unwrap_or(0)) - 5.0) * 0.2)
+            .collect();
+        let d_skip = vec![0.25_f32; n_heads];
+        let z_seq: Vec<f32> = (0..seq_len * n_heads * head_dim)
+            .map(|i| f32::from(u8::try_from(i % 7).unwrap_or(0)) * 0.1)
+            .collect();
+        let x_ssd: Vec<f32> = (0..seq_len * n_heads * head_dim)
+            .map(|i| (f32::from(u8::try_from(i % 13).unwrap_or(0)) - 6.0) * 0.15)
+            .collect();
+
+        let mut step_ssd_state = init_ssd.clone();
+        let mut step_ssd_out = vec![0.0_f32; x_ssd.len()];
+        for t in 0..seq_len {
+            let d_off = t * n_heads * head_dim;
+            let h_off = t * n_heads;
+            let g_off = t * n_groups * state_size;
+            mamba2_ssd_state_step_f32(
+                &mut step_ssd_state,
+                &mut step_ssd_out[d_off..d_off + n_heads * head_dim],
+                &x_ssd[d_off..d_off + n_heads * head_dim],
+                &dt_seq[h_off..h_off + n_heads],
+                Some(&dt_bias),
+                &a_neg,
+                &b_seq[g_off..g_off + n_groups * state_size],
+                &c_seq[g_off..g_off + n_groups * state_size],
+                Some(&d_skip),
+                Some(&z_seq[d_off..d_off + n_heads * head_dim]),
+                n_heads,
+                head_dim,
+                state_size,
+                n_groups,
+            )
+            .expect("ssd step");
+        }
+        let mut chunk_ssd_state = init_ssd;
+        let mut chunk_ssd_out = vec![0.0_f32; x_ssd.len()];
+        mamba2_ssd_chunk_scan_f32(
+            &mut chunk_ssd_state,
+            &mut chunk_ssd_out,
+            &x_ssd,
+            &dt_seq,
+            Some(&dt_bias),
+            &a_neg,
+            &b_seq,
+            &c_seq,
+            Some(&d_skip),
+            Some(&z_seq),
+            seq_len,
+            n_heads,
+            head_dim,
+            state_size,
+            n_groups,
+        )
+        .expect("ssd chunk scan");
+        for (got, expected) in chunk_ssd_out.iter().zip(step_ssd_out.iter()) {
+            assert!((got - expected).abs() < 1e-6);
+        }
+        for (got, expected) in chunk_ssd_state.iter().zip(step_ssd_state.iter()) {
+            assert!((got - expected).abs() < 1e-6);
+        }
+
+        let bad_div = mamba2_ssd_chunk_scan_f32(
+            &mut chunk_ssd_state,
+            &mut chunk_ssd_out,
+            &x_ssd,
+            &dt_seq,
+            None,
+            &a_neg,
+            &b_seq,
+            &c_seq,
+            None,
+            None,
+            seq_len,
+            3,
+            head_dim,
+            state_size,
+            2,
+        );
+        assert!(matches!(bad_div, Err(K3Error::CapabilityMismatch { .. })));
+    }
+
+    #[test]
+    fn test_mamba2_ssd_intra_chunk_ime_i8_causal_cosine() {
+        let (seq_len, state_size, n_groups) = (5, 4, 2);
+        let b_seq: Vec<f32> = (0..seq_len * n_groups * state_size)
+            .map(|i| (f32::from(u8::try_from(i % 11).unwrap_or(0)) - 5.0) * 0.2)
+            .collect();
+        let c_seq: Vec<f32> = (0..seq_len * n_groups * state_size)
+            .map(|i| (f32::from(u8::try_from((i * 3 + 1) % 11).unwrap_or(0)) - 5.0) * 0.2)
+            .collect();
+        let mut scores_i8 = vec![-99.0_f32; n_groups * seq_len * seq_len];
+        mamba2_ssd_intra_chunk_ime_i8(
+            &c_seq,
+            &b_seq,
+            &mut scores_i8,
+            seq_len,
+            n_groups,
+            state_size,
+        )
+        .expect("intra chunk ime i8");
+        let mut dot_num = 0.0_f64;
+        let mut norm_a = 0.0_f64;
+        let mut norm_b = 0.0_f64;
+        for g in 0..n_groups {
+            for i in 0..seq_len {
+                for j in 0..seq_len {
+                    let got = scores_i8[g * seq_len * seq_len + i * seq_len + j];
+                    if j > i {
+                        assert_eq!(got.to_bits(), 0.0_f32.to_bits());
+                    } else {
+                        let c_off = (i * n_groups + g) * state_size;
+                        let b_off = (j * n_groups + g) * state_size;
+                        let ref_dot: f32 = (0..state_size)
+                            .map(|k| c_seq[c_off + k] * b_seq[b_off + k])
+                            .sum();
+                        dot_num += f64::from(got) * f64::from(ref_dot);
+                        norm_a += f64::from(got) * f64::from(got);
+                        norm_b += f64::from(ref_dot) * f64::from(ref_dot);
+                    }
+                }
+            }
+        }
+        let cosine = dot_num / (norm_a.sqrt() * norm_b.sqrt());
+        assert!(cosine > 0.999, "intra-chunk cosine {cosine} <= 0.999");
+    }
+
+    #[test]
+    fn test_rwkv7_lerp_and_wkv_sequences_match_step_by_step() {
+        let seq_len = 4;
+        let n_heads = 2;
+        let head_size = 3;
+        let dim = n_heads * head_size;
+        let prev_init = vec![0.25_f32, -0.5, 0.75, 1.0, -0.25, 0.5];
+        let mu = vec![0.2_f32, 0.4, 0.6, 0.8, 0.1, 0.9];
+        let x_seq: Vec<f32> = (0..seq_len * dim)
+            .map(|i| f32::from(u8::try_from((i * 5 + 3) % 13).unwrap_or(0)) * 0.2 - 1.0)
+            .collect();
+
+        let mut step_prev = prev_init.clone();
+        let mut step_lerp = vec![0.0_f32; seq_len * dim];
+        for t in 0..seq_len {
+            let off = t * dim;
+            rwkv_token_shift_lerp_f32(
+                &step_prev,
+                &x_seq[off..off + dim],
+                &mu,
+                &mut step_lerp[off..off + dim],
+            )
+            .expect("lerp step");
+            step_prev.copy_from_slice(&x_seq[off..off + dim]);
+        }
+
+        let mut seq_prev = prev_init;
+        let mut seq_lerp = vec![0.0_f32; seq_len * dim];
+        rwkv_token_shift_lerp_sequence_f32(&mut seq_prev, &x_seq, &mu, &mut seq_lerp, seq_len, dim)
+            .expect("lerp seq");
+        assert_eq!(step_lerp, seq_lerp);
+        assert_eq!(step_prev, seq_prev);
+
+        let w_seq = vec![0.85_f32; seq_len * dim];
+        let a_seq = vec![0.1_f32; seq_len * dim];
+        let b_seq = vec![-0.1_f32; seq_len * dim];
+        let k_seq = x_seq.clone();
+        let v_seq = seq_lerp.clone();
+        let r_seq = vec![0.5_f32; seq_len * dim];
+        let init_state = vec![0.02_f32; n_heads * head_size * head_size];
+
+        let mut st_step = init_state.clone();
+        let mut out_step = vec![0.0_f32; seq_len * dim];
+        for t in 0..seq_len {
+            let off = t * dim;
+            rwkv7_wkv_delta_rule_step_f32(
+                &mut st_step,
+                &mut out_step[off..off + dim],
+                &r_seq[off..off + dim],
+                &w_seq[off..off + dim],
+                &k_seq[off..off + dim],
+                &v_seq[off..off + dim],
+                &a_seq[off..off + dim],
+                &b_seq[off..off + dim],
+                n_heads,
+                head_size,
+            )
+            .expect("rwkv7 step");
+        }
+
+        let mut st_seq = init_state;
+        let mut out_seq = vec![0.0_f32; seq_len * dim];
+        rwkv7_wkv_delta_rule_sequence_f32(
+            &mut st_seq,
+            &mut out_seq,
+            &r_seq,
+            &w_seq,
+            &k_seq,
+            &v_seq,
+            &a_seq,
+            &b_seq,
+            seq_len,
+            n_heads,
+            head_size,
+        )
+        .expect("rwkv7 sequence");
+        assert_eq!(out_step, out_seq);
+        assert_eq!(st_step, st_seq);
     }
 }
