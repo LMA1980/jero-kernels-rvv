@@ -18,16 +18,19 @@ pub mod ssm;
 pub mod swiglu;
 
 pub use attention::{
-    bidirectional_attention_f32, compute_deberta_rel_pos_bucket, deberta_attention_scale,
-    deberta_disentangled_attention_f32, gated_deltanet_step_f32, gqa_causal_attention_f32,
-    mla_absorbed_attention_f32, pool_sequence_f32,
+    AttentionMaskConfig, bidirectional_attention_f32, compute_deberta_rel_pos_bucket,
+    deberta_attention_scale, deberta_disentangled_attention_f32, gated_deltanet_step_f32,
+    gqa_causal_attention_f32, gqa_causal_attention_prefill_f32,
+    gqa_causal_attention_prefill_kv_heads_f32, gqa_causal_attention_prefill_strided_kv_f32,
+    gqa_causal_attention_with_scratch_f32, gqa_kv_head_partition, mla_absorbed_attention_f32,
+    pool_sequence_f32,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use ime::tile_dot_rvv;
 pub use ime::{
     TQ1_0_BLOCK_BYTES, TQ1_0_BLOCK_ELEMENTS, TQ2_0_BLOCK_BYTES, TQ2_0_BLOCK_ELEMENTS,
-    bitlinear_i8_ime, bitlinear_i8_rvv, convert_i2_s_blocks_to_tq2_0, pack_tiles_aligned128,
-    unpack_tq1_0_block_i8, unpack_tq2_0_block_i8,
+    bitlinear_i8_ime, bitlinear_i8_rvv, convert_i2_s_blocks_to_tq2_0, has_ime,
+    pack_tiles_aligned128, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8, vlen_bytes,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::rmsnorm_unit_offset_rvv;
@@ -66,10 +69,12 @@ pub use quant::{
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use repack::quantize_row_f32_to_q8_32_rvv;
 pub use repack::{
-    Aligned128, AlignedQuantMatrix, QuantizedActQ8, RepackedWeight, gemm_repacked,
-    gemm_repacked_f32, gemm_repacked_f32_rows, gemm_repacked_rows, gemm_repacked_vla_sim,
-    gemv_repacked, gemv_repacked_f32, gemv_repacked_f32_rows, gemv_repacked_rows,
-    quantize_row_f32_to_q8_32, quantize_row_f32_to_q8_32_scalar, repack_q5_0_to_ime_8x16,
+    Aligned128, AlignedQuantMatrix, BlockScaledTileLayout, PackedNibbleMatrix, QuantizedActQ8,
+    RepackedWeight, gemm_q4_0_ime, gemm_q4_k_ime, gemm_repacked, gemm_repacked_f32,
+    gemm_repacked_f32_rows, gemm_repacked_rows, gemm_repacked_vla_sim, gemv_repacked,
+    gemv_repacked_f32, gemv_repacked_f32_rows, gemv_repacked_rows, quantize_row_f32_to_q8_32,
+    quantize_row_f32_to_q8_32_scalar, repack_into_tile_range, repack_nibble_into_tile_range,
+    repack_q4_k_m_parallel_slices, repack_q5_0_to_ime_8x16,
 };
 pub use residual::{
     ngpt_residual_lerp_f32, ngpt_residual_lerp_f32_scalar, ngpt_residual_lerp_in_place,
