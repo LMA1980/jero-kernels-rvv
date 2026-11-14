@@ -157,22 +157,30 @@ fn quantize_block_q8_0_scalar(x: &[f32], blk: &mut BlockQ8_0) {
 
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[inline]
-fn quantize_block_q8_0_rvv(x: &[f32], blk: &mut BlockQ8_0) {
+fn finite_absmax_rvv(x: &[f32]) -> f32 {
     let ptr_x = x.as_ptr();
-    let rem = Q8_0_BLOCK_ELEMENTS;
+    let rem = x.len();
+    if rem == 0 {
+        return 0.0;
+    }
+    let zero_f = 0.0_f32;
+    let fmax = f32::MAX;
     let amax: f32;
-    // SAFETY: `x` holds 32 readable `f32` elements; `v0` holds mask for finite/non-NaN lanes,
-    // `v2` starts at `0.0_f32` and tracks absmax safely across all `VLEN >= 128` implementations.
+    // SAFETY: `x` holds `rem` readable `f32` elements; `vmfle.vf v0, |x|, f32::MAX` yields `1`
+    // strictly for finite lanes and replaces non-finite lanes (`NaN`, `+-Inf`) with `0.0` prior to
+    // `vfredmax.vs` across strip-mined `e32, m4` (`VLEN >= 128` safe).
     unsafe {
         core::arch::asm!(
             "vsetivli zero, 1, e32, m1, ta, ma",
-            "vmv.v.i v2, 0",
+            "vfmv.s.f v2, {z}",
             "2:",
             "vsetvli {vl}, {rem}, e32, m4, ta, ma",
             "vle32.v v8, ({px})",
-            "vmfeq.vv v0, v8, v8",
             "vfabs.v v12, v8",
-            "vfredmax.vs v2, v12, v2, v0.t",
+            "vmfle.vf v0, v12, {fmax}",
+            "vfmv.v.f v16, {z}",
+            "vmerge.vvm v12, v16, v12, v0",
+            "vfredmax.vs v2, v12, v2",
             "slli t0, {vl}, 2",
             "add {px}, {px}, t0",
             "sub {rem}, {rem}, {vl}",
@@ -181,6 +189,8 @@ fn quantize_block_q8_0_rvv(x: &[f32], blk: &mut BlockQ8_0) {
             "vfmv.f.s {amax}, v2",
             px = inout(reg) ptr_x => _,
             rem = inout(reg) rem => _,
+            z = in(freg) zero_f,
+            fmax = in(freg) fmax,
             amax = out(freg) amax,
             vl = out(reg) _,
             out("t0") _,
@@ -194,50 +204,80 @@ fn quantize_block_q8_0_rvv(x: &[f32], blk: &mut BlockQ8_0) {
             out("v13") _,
             out("v14") _,
             out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
             options(nostack, readonly),
         );
     }
+    amax
+}
 
-    if !amax.is_finite() {
-        quantize_block_q8_0_scalar(x, blk);
-        return;
-    }
-    if amax == 0.0 {
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+#[inline]
+fn quantize_block_q8_0_rvv(x: &[f32], blk: &mut BlockQ8_0) {
+    let amax = finite_absmax_rvv(x);
+    if !amax.is_finite() || amax == 0.0 {
         *blk = BlockQ8_0::ZERO;
         return;
     }
 
-    blk.d = amax / 127.0_f32;
     let inv_scale = 127.0_f32 / amax;
+    if !inv_scale.is_finite() {
+        quantize_block_q8_0_scalar(x, blk);
+        return;
+    }
+    blk.d = amax / 127.0_f32;
     let ptr_x2 = x.as_ptr();
     let ptr_q = blk.qs.as_mut_ptr();
     let rem2 = Q8_0_BLOCK_ELEMENTS;
-    // SAFETY: `x` has 32 readable `f32`s and `blk.qs` has 32 writable `i8`s; `e32,m4` ->
-    // `e16,m2` -> `e8,m1` uses strictly disjoint groups (`v8..v11`, `v4..v5`, `v2`) and
-    // respects `VLEN >= 128`.
+    let zero_f = 0.0_f32;
+    let fmax = f32::MAX;
+    let min_q = -127.0_f32;
+    let max_q = 127.0_f32;
+    // SAFETY: `x` has 32 readable `f32`s and `blk.qs` has 32 writable `i8`s; `vmfle.vf` +
+    // `vmerge.vvm` zeroes non-finite lanes (`NaN`, `+-Inf`) prior to scaling and clamping to
+    // `[-127.0, 127.0]`. `csrrwi {saved_frm}, frm, 4` selects `RMM` (ties-away-from-zero matching
+    // `f32::round`) and restores the caller's `frm`. `e32,m4` -> `e16,m2` -> `e8,m1` groups are
+    // strictly disjoint and `VLEN >= 128` safe.
     unsafe {
         core::arch::asm!(
+            "csrrwi {saved_frm}, frm, 4",
             "2:",
             "vsetvli {vl}, {rem}, e32, m4, ta, ma",
             "vle32.v v8, ({px})",
+            "vfabs.v v12, v8",
+            "vmfle.vf v0, v12, {fmax}",
+            "vfmv.v.f v16, {z}",
+            "vmerge.vvm v8, v16, v8, v0",
             "vfmul.vf v8, v8, {inv_s}",
+            "vfmax.vf v8, v8, {min_q}",
+            "vfmin.vf v8, v8, {max_q}",
             "vfcvt.x.f.v v8, v8",
             "vsetvli zero, {vl}, e16, m2, ta, ma",
-            "vnclip.wi v4, v8, 0",
+            "vnsra.wi v4, v8, 0",
             "vsetvli zero, {vl}, e8, m1, ta, ma",
-            "vnclip.wi v2, v4, 0",
+            "vnsra.wi v2, v4, 0",
             "vse8.v v2, ({pq})",
             "slli t0, {vl}, 2",
             "add {px}, {px}, t0",
             "add {pq}, {pq}, {vl}",
             "sub {rem}, {rem}, {vl}",
             "bnez {rem}, 2b",
+            "csrrw zero, frm, {saved_frm}",
             px = inout(reg) ptr_x2 => _,
             pq = inout(reg) ptr_q => _,
             rem = inout(reg) rem2 => _,
+            z = in(freg) zero_f,
+            fmax = in(freg) fmax,
             inv_s = in(freg) inv_scale,
+            min_q = in(freg) min_q,
+            max_q = in(freg) max_q,
+            saved_frm = out(reg) _,
             vl = out(reg) _,
             out("t0") _,
+            out("v0") _,
             out("v2") _,
             out("v4") _,
             out("v5") _,
@@ -245,6 +285,14 @@ fn quantize_block_q8_0_rvv(x: &[f32], blk: &mut BlockQ8_0) {
             out("v9") _,
             out("v10") _,
             out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
             options(nostack),
         );
     }
@@ -319,92 +367,73 @@ fn quantize_block_q8_k_scalar(x: &[f32], blk: &mut BlockQ8K) {
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 #[inline]
 fn quantize_block_q8_k_rvv(x: &[f32], blk: &mut BlockQ8K) {
-    let ptr_x = x.as_ptr();
-    let rem = Q8_K_BLOCK_ELEMENTS;
-    let amax: f32;
-    // SAFETY: `x` holds 256 readable `f32` elements; `v0` masks non-NaN elements prior to
-    // `vfredmax.vs` across strip-mined `e32, m4` (`VLEN >= 128` safe).
-    unsafe {
-        core::arch::asm!(
-            "vsetivli zero, 1, e32, m1, ta, ma",
-            "vmv.v.i v2, 0",
-            "2:",
-            "vsetvli {vl}, {rem}, e32, m4, ta, ma",
-            "vle32.v v8, ({px})",
-            "vmfeq.vv v0, v8, v8",
-            "vfabs.v v12, v8",
-            "vfredmax.vs v2, v12, v2, v0.t",
-            "slli t0, {vl}, 2",
-            "add {px}, {px}, t0",
-            "sub {rem}, {rem}, {vl}",
-            "bnez {rem}, 2b",
-            "vsetivli zero, 1, e32, m1, ta, ma",
-            "vfmv.f.s {amax}, v2",
-            px = inout(reg) ptr_x => _,
-            rem = inout(reg) rem => _,
-            amax = out(freg) amax,
-            vl = out(reg) _,
-            out("t0") _,
-            out("v0") _,
-            out("v2") _,
-            out("v8") _,
-            out("v9") _,
-            out("v10") _,
-            out("v11") _,
-            out("v12") _,
-            out("v13") _,
-            out("v14") _,
-            out("v15") _,
-            options(nostack, readonly),
-        );
-    }
-
-    if !amax.is_finite() {
-        quantize_block_q8_k_scalar(x, blk);
-        return;
-    }
-    if amax == 0.0 {
+    let amax = finite_absmax_rvv(x);
+    if !amax.is_finite() || amax == 0.0 {
         *blk = BlockQ8K::ZERO;
         return;
     }
 
-    blk.d = amax / 127.0_f32;
     let inv_scale = 127.0_f32 / amax;
+    if !inv_scale.is_finite() {
+        quantize_block_q8_k_scalar(x, blk);
+        return;
+    }
+    blk.d = amax / 127.0_f32;
     let ptr_x2 = x.as_ptr();
     let ptr_q = blk.qs.as_mut_ptr();
     let ptr_bs = blk.bsums.as_mut_ptr();
     let sb_rem = 16_usize;
+    let zero_f = 0.0_f32;
+    let fmax = f32::MAX;
+    let min_q = -127.0_f32;
+    let max_q = 127.0_f32;
     // SAFETY: `x` holds 256 readable `f32`s (`16 x 16`), `blk.qs` has 256 writable `i8`s, and
-    // `blk.bsums` has 16 2-byte-aligned `i16`s. All vector lengths are `16` at `e32,m4`/`e16,m2`/
-    // `e8,m1` (`<= VLMAX` on `VLEN >= 128`), and `16 * [-127, 127]` fits in `i16` (`2032`).
+    // `blk.bsums` has 16 2-byte-aligned `i16`s. `vmfle.vf` + `vmerge.vvm` zeroes non-finite lanes
+    // (`NaN`, `+-Inf`) prior to scaling, clamping to `[-127.0, 127.0]`, and rounding with `frm = RMM`
+    // (`4`), guaranteeing `v4` (`i16`) equals `v2` (`i8`) and `sum(v4)` fits cleanly in `i16`
+    // (`<= 2032`). All vector lengths are `16` at `e32,m4`/`e16,m2`/`e8,m1` (`<= VLMAX` on
+    // `VLEN >= 128`).
     unsafe {
         core::arch::asm!(
+            "csrrwi {saved_frm}, frm, 4",
             "2:",
             "vsetivli zero, 16, e32, m4, ta, ma",
             "vle32.v v8, ({px})",
+            "vfabs.v v12, v8",
+            "vmfle.vf v0, v12, {fmax}",
+            "vfmv.v.f v16, {z}",
+            "vmerge.vvm v8, v16, v8, v0",
             "vfmul.vf v8, v8, {inv_s}",
+            "vfmax.vf v8, v8, {min_q}",
+            "vfmin.vf v8, v8, {max_q}",
             "vfcvt.x.f.v v8, v8",
             "vsetivli zero, 16, e16, m2, ta, ma",
-            "vnclip.wi v4, v8, 0",
+            "vnsra.wi v4, v8, 0",
+            "vsetivli zero, 16, e8, m1, ta, ma",
+            "vnsra.wi v2, v4, 0",
+            "vse8.v v2, ({pq})",
             "vsetivli zero, 1, e16, m1, ta, ma",
             "vmv.v.i v0, 0",
             "vsetivli zero, 16, e16, m2, ta, ma",
             "vredsum.vs v0, v4, v0",
             "vmv.x.s t0, v0",
             "sh t0, 0({pbs})",
-            "vsetivli zero, 16, e8, m1, ta, ma",
-            "vnclip.wi v2, v4, 0",
-            "vse8.v v2, ({pq})",
             "addi {px}, {px}, 64",
             "addi {pq}, {pq}, 16",
             "addi {pbs}, {pbs}, 2",
             "addi {sb}, {sb}, -1",
             "bnez {sb}, 2b",
+            "csrrw zero, frm, {saved_frm}",
             px = inout(reg) ptr_x2 => _,
             pq = inout(reg) ptr_q => _,
             pbs = inout(reg) ptr_bs => _,
             sb = inout(reg) sb_rem => _,
+            z = in(freg) zero_f,
+            fmax = in(freg) fmax,
             inv_s = in(freg) inv_scale,
+            min_q = in(freg) min_q,
+            max_q = in(freg) max_q,
+            saved_frm = out(reg) _,
             out("t0") _,
             out("v0") _,
             out("v2") _,
@@ -414,6 +443,14 @@ fn quantize_block_q8_k_rvv(x: &[f32], blk: &mut BlockQ8K) {
             out("v9") _,
             out("v10") _,
             out("v11") _,
+            out("v12") _,
+            out("v13") _,
+            out("v14") _,
+            out("v15") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
             options(nostack),
         );
     }
@@ -3231,29 +3268,59 @@ mod tests {
             Err(K3Error::TensorBoundsError { .. })
         ));
 
-        let mut x64 = test_f32_row(64, 1);
-        x64[3] = f32::NAN;
-        x64[7] = f32::INFINITY;
-        x64[32..64].fill(0.0);
-        let mut q8_0 = [BlockQ8_0::ZERO; 2];
-        quantize_row_q8_0_f32(&x64, &mut q8_0).expect("quantize q8_0");
+        // Block 0: mixed finite + NaN (no Inf); Block 1: mixed finite + Inf/-Inf; Block 2: all non-finite.
+        let mut x96 = test_f32_row(96, 1);
+        x96[3] = f32::NAN;
+        x96[11] = -f32::NAN;
+        x96[32 + 7] = f32::INFINITY;
+        x96[32 + 19] = f32::NEG_INFINITY;
+        x96[64..96].fill(f32::NAN);
+        x96[64] = f32::INFINITY;
+        x96[95] = 0.0;
+        let mut q8_0 = [BlockQ8_0::ZERO; 3];
+        quantize_row_q8_0_f32(&x96, &mut q8_0).expect("quantize q8_0");
         assert!(q8_0[0].d > 0.0);
         assert_eq!(q8_0[0].qs[3], 0);
-        assert_eq!(q8_0[0].qs[7], 0);
-        assert_eq!(q8_0[1], BlockQ8_0::ZERO);
+        assert_eq!(q8_0[0].qs[11], 0);
+        assert!(q8_0[0].qs.iter().any(|&q| q != 0));
+        let mut scalar_block_0 = BlockQ8_0::ZERO;
+        quantize_block_q8_0_scalar(&x96[0..32], &mut scalar_block_0);
+        assert_eq!(q8_0[0], scalar_block_0);
+        assert!(q8_0[1].d > 0.0);
+        assert_eq!(q8_0[1].qs[7], 0);
+        assert_eq!(q8_0[1].qs[19], 0);
+        assert!(q8_0[1].qs.iter().any(|&q| q != 0));
+        assert_eq!(q8_0[2], BlockQ8_0::ZERO);
 
-        let mut x256 = test_f32_row(256, 2);
-        x256[5] = f32::NEG_INFINITY;
-        let mut q8_k = [BlockQ8K::ZERO; 1];
-        quantize_row_q8_k(&x256, &mut q8_k).expect("quantize q8_k");
+        // Block 0: mixed finite + NaN (no Inf); Block 1: mixed finite + +/-Inf; Block 2: all non-finite.
+        let mut x768 = test_f32_row(768, 2);
+        x768[3] = f32::NAN;
+        x768[16 + 9] = -f32::NAN;
+        x768[256 + 5] = f32::NEG_INFINITY;
+        x768[256 + 37] = f32::INFINITY;
+        x768[512..768].fill(f32::NAN);
+        x768[512] = f32::NEG_INFINITY;
+        let mut q8_k = [BlockQ8K::ZERO; 3];
+        quantize_row_q8_k(&x768, &mut q8_k).expect("quantize q8_k");
         assert!(q8_k[0].d > 0.0);
-        assert_eq!(q8_k[0].qs[5], 0);
-        for sb in 0..16 {
-            let expected_bsum: i16 = q8_k[0].qs[sb * 16..(sb + 1) * 16]
-                .iter()
-                .map(|&q| i16::from(q))
-                .sum();
-            assert_eq!(q8_k[0].bsums[sb], expected_bsum);
+        assert_eq!(q8_k[0].qs[3], 0);
+        assert_eq!(q8_k[0].qs[16 + 9], 0);
+        assert!(q8_k[0].qs.iter().any(|&q| q != 0));
+        let mut scalar_block_k = BlockQ8K::ZERO;
+        quantize_block_q8_k_scalar(&x768[0..256], &mut scalar_block_k);
+        assert_eq!(q8_k[0], scalar_block_k);
+        assert!(q8_k[1].d > 0.0);
+        assert_eq!(q8_k[1].qs[5], 0);
+        assert_eq!(q8_k[1].qs[37], 0);
+        assert_eq!(q8_k[2], BlockQ8K::ZERO);
+        for blk in &q8_k {
+            for sb in 0..16 {
+                let expected_bsum: i16 = blk.qs[sb * 16..(sb + 1) * 16]
+                    .iter()
+                    .map(|&q| i16::from(q))
+                    .sum();
+                assert_eq!(blk.bsums[sb], expected_bsum);
+            }
         }
     }
 
