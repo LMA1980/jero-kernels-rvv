@@ -14,6 +14,7 @@ pub mod quant;
 pub mod repack;
 pub mod residual;
 pub mod rope;
+pub mod ssm;
 pub mod swiglu;
 
 pub use attention::{
@@ -69,6 +70,10 @@ pub use residual::{
 };
 pub use rope::{
     RopeScalingConfig, apply_rope_inplace, apply_rope_with_inv_freq, precompute_rope_inv_freq,
+};
+pub use ssm::{
+    lfm2_shortconv_step_f32, mamba2_conv1d_silu_step, mamba2_ssd_state_step_f32,
+    rwkv_token_shift_lerp_f32, rwkv7_wkv_delta_rule_step_f32, silu_scalar_f32, softplus_f32,
 };
 pub use swiglu::{bf16_to_f32_finite, geglu_f32, logit_softcap_tanh_inplace, swiglu_f32};
 
