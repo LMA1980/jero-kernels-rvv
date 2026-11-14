@@ -76,8 +76,8 @@ fn test_unpack_tq1_0_and_tq2_0() {
     block_tq2[0..2].copy_from_slice(&0x0000_u16.to_le_bytes());
     assert_eq!(unpack_tq2_0_block_i8(&block_tq2, &mut out_tq2), 0.0);
 
-    block_tq2[0..2].copy_from_slice(&0x7C00_u16.to_le_bytes()); // +Inf clamped
-    assert_eq!(unpack_tq2_0_block_i8(&block_tq2, &mut out_tq2), 0.0625);
+    block_tq2[0..2].copy_from_slice(&0x7C00_u16.to_le_bytes()); // +Inf clamped safely to 0.0
+    assert_eq!(unpack_tq2_0_block_i8(&block_tq2, &mut out_tq2), 0.0);
 }
 
 // ============================================================================

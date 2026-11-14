@@ -679,8 +679,8 @@ fn test_challenge_f16_to_f32_finite_exhaustive_oracle() {
 
         let exp = (bits >> 10) & 0x1F;
         if exp == 0x1F {
-            // Clamped NaN/Inf
-            assert!((val - 0.0625).abs() < 1e-6 || (val - -0.0625).abs() < 1e-6);
+            // Clamped NaN/Inf must collapse safely to +0.0
+            assert_eq!(val.to_bits(), 0.0_f32.to_bits());
         }
     }
 }

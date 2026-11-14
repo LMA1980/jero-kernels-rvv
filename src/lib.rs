@@ -69,13 +69,20 @@ pub use residual::{
     ngpt_residual_lerp_f32_rvv, ngpt_residual_lerp_in_place_rvv, ngpt_residual_lerp_inplace_rvv,
 };
 pub use rope::{
-    RopeScalingConfig, apply_rope_inplace, apply_rope_with_inv_freq, precompute_rope_inv_freq,
+    RopeScalingConfig, RopeType, apply_rope_inplace, apply_rope_inplace_with_layout,
+    apply_rope_with_cos_sin, apply_rope_with_inv_freq, apply_rope_with_inv_freq_and_layout,
+    compute_rope_cos_sin, precompute_rope_inv_freq,
 };
 pub use ssm::{
     lfm2_shortconv_step_f32, mamba2_conv1d_silu_step, mamba2_ssd_state_step_f32,
     rwkv_token_shift_lerp_f32, rwkv7_wkv_delta_rule_step_f32, silu_scalar_f32, softplus_f32,
 };
-pub use swiglu::{bf16_to_f32_finite, geglu_f32, logit_softcap_tanh_inplace, swiglu_f32};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use swiglu::swiglu_f32_rvv;
+pub use swiglu::{
+    bf16_to_f32_finite, bf16_to_f32_ieee, geglu_f32, logit_softcap_tanh_inplace, swiglu_f32,
+    swiglu_f32_scalar,
+};
 
 /// Number of scalar elements per `Q4_K_M` super-block.
 pub const Q4_K_M_BLOCK_ELEMENTS: usize = 256;
@@ -148,11 +155,62 @@ pub trait VectorKernel: Send + Sync + std::fmt::Debug {
         weights: &TensorView<'_>,
         input: &[f32],
     ) -> Result<(), K3Error>;
+
+    /// Computes gated `SwiGLU` activation (`silu(gate) * up`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if slice lengths mismatch or are empty.
+    fn swiglu_f32(&self, out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Error> {
+        swiglu_f32(out, gate, up)
+    }
+
+    /// Computes `RoPE` cosine/sine tables into caller-supplied scratch slices without allocating.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error`] if slice lengths mismatch or frequency parameters are invalid.
+    fn compute_rope_cos_sin(
+        &self,
+        pos: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        inv_freq: Option<&[f32]>,
+        cos_out: &mut [f32],
+        sin_out: &mut [f32],
+    ) -> Result<(), K3Error> {
+        compute_rope_cos_sin(pos, freq_base, freq_scale, inv_freq, cos_out, sin_out)
+    }
+
+    /// Applies rotary position embeddings in-place using precomputed `cos`/`sin` tables.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if head/rotary dimensions or table lengths are invalid.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "zero-allocation RoPE kernel takes explicit head geometry, layout, and cos/sin slices"
+    )]
+    fn apply_rope_with_cos_sin(
+        &self,
+        x: &mut [f32],
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_type: RopeType,
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<(), K3Error> {
+        apply_rope_with_cos_sin(x, num_heads, head_dim, rotary_dim, rope_type, cos, sin)
+    }
 }
 
 /// Baseline RVV 1.0 / portable scalar kernel dispatcher (US-01.6.2, ADR-029).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BaselineKernel;
+
+/// Alias for [`BaselineKernel`] exposing RVV-dispatched kernel methods on `riscv64` targets.
+pub type RvvKernel = BaselineKernel;
 
 impl BaselineKernel {
     /// Creates a new baseline kernel dispatcher.
@@ -254,13 +312,41 @@ impl VectorKernel for BaselineKernel {
             vec_dot_q5_k_scalar(output, weights, input)
         }
     }
+
+    fn swiglu_f32(&self, out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Error> {
+        swiglu_f32(out, gate, up)
+    }
+
+    fn compute_rope_cos_sin(
+        &self,
+        pos: usize,
+        freq_base: f32,
+        freq_scale: f32,
+        inv_freq: Option<&[f32]>,
+        cos_out: &mut [f32],
+        sin_out: &mut [f32],
+    ) -> Result<(), K3Error> {
+        compute_rope_cos_sin(pos, freq_base, freq_scale, inv_freq, cos_out, sin_out)
+    }
+
+    fn apply_rope_with_cos_sin(
+        &self,
+        x: &mut [f32],
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_type: RopeType,
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<(), K3Error> {
+        apply_rope_with_cos_sin(x, num_heads, head_dim, rotary_dim, rope_type, cos, sin)
+    }
 }
 
-/// Converts an IEEE 754 half-precision `f16` bit pattern (`u16`) to single-precision `f32`.
-/// Non-finite (`NaN`/`Inf`) half-precision bit patterns are mapped to a deterministic finite scale
-/// so arbitrary synthetic weight buffers never poison activations with `NaN`.
+/// Strictly converts an IEEE 754 half-precision `f16` bit pattern (`u16`) to single-precision `f32`,
+/// preserving `NaN`, `±Inf`, signed zeros, subnormals, and normal values.
 #[must_use]
-pub fn f16_to_f32_finite(bits: u16) -> f32 {
+pub fn f16_to_f32_ieee(bits: u16) -> f32 {
     let sign = u32::from((bits >> 15) & 0x0001);
     let exp = u32::from((bits >> 10) & 0x001F);
     let mant = u32::from(bits & 0x03FF);
@@ -280,14 +366,27 @@ pub fn f16_to_f32_finite(bits: u16) -> f32 {
         let f32_bits = (sign << 31) | (e << 23) | (m << 13);
         f32::from_bits(f32_bits)
     } else if exp == 0x1F {
-        // Clamp NaN/Inf to a small deterministic finite scale
-        let val = 0.0625_f32;
-        if sign == 1 { -val } else { val }
+        let f32_bits = if mant == 0 {
+            (sign << 31) | 0x7F80_0000
+        } else {
+            // Preserve non-zero NaN payload while setting canonical quiet NaN bit.
+            (sign << 31) | 0x7FC0_0000 | (mant << 13)
+        };
+        f32::from_bits(f32_bits)
     } else {
         let f32_exp = exp + (127 - 15);
         let f32_bits = (sign << 31) | (f32_exp << 23) | (mant << 13);
         f32::from_bits(f32_bits)
     }
+}
+
+/// Converts an IEEE 754 half-precision `f16` bit pattern (`u16`) to single-precision `f32`.
+/// Non-finite (`NaN`/`±Inf`) half-precision bit patterns are clamped deterministically to `0.0_f32`
+/// so malformed or sentinel block headers never poison activations or inject non-zero scales.
+#[must_use]
+pub fn f16_to_f32_finite(bits: u16) -> f32 {
+    let val = f16_to_f32_ieee(bits);
+    if val.is_finite() { val } else { 0.0_f32 }
 }
 
 /// Dequantizes a single 144-byte `Q4_K_M` super-block into 256 `f32` elements (ADR-017, US-01.6.2).

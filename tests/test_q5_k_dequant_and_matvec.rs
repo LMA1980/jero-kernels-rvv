@@ -45,8 +45,8 @@ fn reference_ggml_f16_to_f32(bits: u16) -> f32 {
             f32::from_bits(((sign as u32) << 31) | (e << 23) | (m << 13))
         }
     } else if exp == 0x1F {
-        let val = 0.0625_f32;
-        if sign == 1 { -val } else { val }
+        let _ = sign;
+        0.0_f32
     } else {
         let f32_exp = exp as u32 + (127 - 15);
         f32::from_bits(((sign as u32) << 31) | (f32_exp << 23) | ((mant as u32) << 13))
