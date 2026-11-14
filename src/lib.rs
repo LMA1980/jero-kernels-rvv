@@ -16,7 +16,10 @@ pub mod residual;
 pub mod rope;
 pub mod swiglu;
 
-pub use attention::{bidirectional_attention_f32, gqa_causal_attention_f32, pool_sequence_f32};
+pub use attention::{
+    bidirectional_attention_f32, compute_deberta_rel_pos_bucket, deberta_attention_scale,
+    deberta_disentangled_attention_f32, gqa_causal_attention_f32, pool_sequence_f32,
+};
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use ime::tile_dot_rvv;
 pub use ime::{
