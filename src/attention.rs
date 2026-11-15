@@ -1171,7 +1171,7 @@ fn softmax_scores_inplace_rvv(scores: &mut [f32]) {
     }
 }
 
-fn softmax_scores_inplace(scores: &mut [f32]) {
+pub(crate) fn softmax_scores_inplace(scores: &mut [f32]) {
     #[cfg(all(target_arch = "riscv64", not(miri)))]
     {
         softmax_scores_inplace_rvv(scores);
