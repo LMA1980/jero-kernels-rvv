@@ -9,6 +9,7 @@ use jero_core::{K3Error, QuantType, TensorView};
 
 pub mod attention;
 pub mod ime;
+pub mod machine;
 pub mod norm;
 pub mod quant;
 pub mod repack;
@@ -32,6 +33,17 @@ pub use ime::{
     bitlinear_i8_ime, bitlinear_i8_rvv, convert_i2_s_blocks_to_tq2_0, has_ime,
     pack_tiles_aligned128, unpack_tq1_0_block_i8, unpack_tq2_0_block_i8, vlen_bytes,
 };
+pub use machine::{
+    AxisMlpWeights, TabPfnAttentionAxis, TabPfnAttentionShape, gelu_f32, gelu_f32_scalar,
+    gelu_inplace_f32, layernorm_f32, layernorm_f32_scalar, layernorm_f32_vla_stripmined,
+    tabpfn_dual_axis_attention_f32, tabpfn_dual_axis_self_attention_f32,
+    tabpfn_feature_attention_f32, tabpfn_sample_attention_f32, tokenize_continuous_features_f32,
+    tokenize_continuous_features_f32_scalar, tokenize_continuous_features_f32_vla_stripmined,
+    ttm_channel_mix_f32, ttm_patch_mix_f32, ttm_time_channel_mix_f32,
+    ttm_time_channel_mix_scratch_len, ttm_time_channel_mix_with_scratch_f32,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use machine::{layernorm_f32_rvv, tokenize_continuous_features_f32_rvv};
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use norm::rmsnorm_unit_offset_rvv;
 pub use norm::{
@@ -109,8 +121,8 @@ pub use ssm::{
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use swiglu::swiglu_f32_rvv;
 pub use swiglu::{
-    bf16_to_f32_finite, bf16_to_f32_ieee, geglu_f32, logit_softcap_tanh_inplace, swiglu_f32,
-    swiglu_f32_scalar,
+    bf16_to_f32_finite, bf16_to_f32_ieee, geglu_f32, gelu_scalar_f32, logit_softcap_tanh_inplace,
+    swiglu_f32, swiglu_f32_scalar,
 };
 
 /// Number of scalar elements per `Q4_K_M` super-block.
@@ -235,6 +247,102 @@ pub trait VectorKernel: Send + Sync + std::fmt::Debug {
 
     fn argmax_f32(&self, logits: &[f32]) -> Option<usize> {
         argmax_f32(logits)
+    }
+
+    /// Tokenizes continuous scalar features (`raw[i] * weight[i, d] + bias[i, d]`) for
+    /// `FT-Transformer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on zero/overflow dimensions, mismatched slice
+    /// lengths, or non-finite inputs.
+    fn tokenize_continuous_features_f32(
+        &self,
+        out: &mut [f32],
+        raw: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        n_features: usize,
+        d_token: usize,
+    ) -> Result<(), K3Error> {
+        tokenize_continuous_features_f32(out, raw, weight, bias, n_features, d_token)
+    }
+
+    /// Evaluates element-wise `GELU_tanh` activation into `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if slices mismatch/are empty or `input` is non-finite.
+    fn gelu_f32(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
+        gelu_f32(out, input)
+    }
+
+    /// Evaluates Layer Normalization over `input` with optional affine scale/bias into `out`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] if geometry is invalid, `eps <= 0`, or entries are non-finite.
+    fn layernorm_f32(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        weight: Option<&[f32]>,
+        bias: Option<&[f32]>,
+        eps: f32,
+    ) -> Result<(), K3Error> {
+        layernorm_f32(out, input, weight, bias, eps)
+    }
+
+    /// Executes a `TinyTimeMixers` (`TTM`) dual-axis (`time/patch` + `channel`) residual MLP mixer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on geometry mismatch, `eps <= 0`, or non-finite values.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "TTM kernel receives tensor dimensions, dual axis weights, and normalization epsilon"
+    )]
+    fn ttm_time_channel_mix_f32(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        n_patches: usize,
+        n_channels: usize,
+        time_weights: &AxisMlpWeights<'_>,
+        channel_weights: &AxisMlpWeights<'_>,
+        eps: f32,
+    ) -> Result<(), K3Error> {
+        ttm_time_channel_mix_f32(
+            out,
+            input,
+            n_patches,
+            n_channels,
+            time_weights,
+            channel_weights,
+            eps,
+        )
+    }
+
+    /// Dispatches `TabPFN-v2` dual-axis attention along `axis` (`Feature` or `Sample`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`K3Error::TensorBoundsError`] on invalid geometry/scale, buffer mismatch, or non-finite inputs.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dual-axis attention dispatches explicit Q/K/V slices, table shape, axis selector, and scale"
+    )]
+    fn tabpfn_dual_axis_attention_f32(
+        &self,
+        out: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        shape: TabPfnAttentionShape,
+        axis: TabPfnAttentionAxis,
+        scale: f32,
+    ) -> Result<(), K3Error> {
+        tabpfn_dual_axis_attention_f32(out, q, k, v, shape, axis, scale)
     }
 }
 
@@ -377,6 +485,67 @@ impl VectorKernel for BaselineKernel {
 
     fn argmax_f32(&self, logits: &[f32]) -> Option<usize> {
         argmax_f32(logits)
+    }
+
+    fn tokenize_continuous_features_f32(
+        &self,
+        out: &mut [f32],
+        raw: &[f32],
+        weight: &[f32],
+        bias: &[f32],
+        n_features: usize,
+        d_token: usize,
+    ) -> Result<(), K3Error> {
+        tokenize_continuous_features_f32(out, raw, weight, bias, n_features, d_token)
+    }
+
+    fn gelu_f32(&self, out: &mut [f32], input: &[f32]) -> Result<(), K3Error> {
+        gelu_f32(out, input)
+    }
+
+    fn layernorm_f32(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        weight: Option<&[f32]>,
+        bias: Option<&[f32]>,
+        eps: f32,
+    ) -> Result<(), K3Error> {
+        layernorm_f32(out, input, weight, bias, eps)
+    }
+
+    fn ttm_time_channel_mix_f32(
+        &self,
+        out: &mut [f32],
+        input: &[f32],
+        n_patches: usize,
+        n_channels: usize,
+        time_weights: &AxisMlpWeights<'_>,
+        channel_weights: &AxisMlpWeights<'_>,
+        eps: f32,
+    ) -> Result<(), K3Error> {
+        ttm_time_channel_mix_f32(
+            out,
+            input,
+            n_patches,
+            n_channels,
+            time_weights,
+            channel_weights,
+            eps,
+        )
+    }
+
+    fn tabpfn_dual_axis_attention_f32(
+        &self,
+        out: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        shape: TabPfnAttentionShape,
+        axis: TabPfnAttentionAxis,
+        scale: f32,
+    ) -> Result<(), K3Error> {
+        tabpfn_dual_axis_attention_f32(out, q, k, v, shape, axis, scale)
     }
 }
 

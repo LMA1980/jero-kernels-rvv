@@ -29,3 +29,9 @@ description: "Write and verify VLA RVV 1.0 vector kernels, SpacemiT K3 A100 XSMT
 
 - **Greedy Logit Selection (`argmax_f32`)**: Vectorized two-pass VLA RVV 1.0 `vfredmax.vs` (masked against `NaN` with `vmfeq.vv`) + `vmfeq.vf` + `vfirst.m` exposed standalone and via `VectorKernel::argmax_f32`, deterministically returning the lowest index on exact ties and `None` on empty or all-`NaN` slices.
 - **Zero-Allocation Chunk/Sequence Scans (`ssm`)**: `mamba2_conv1d_silu_chunk_f32`, `mamba2_ssd_chunk_scan_f32` (`F32` exponential decay with multi-group `n_groups` sharing), `mamba2_ssd_intra_chunk_ime_i8` (causal `C * B^T` stack-tiled `i8` dot product), `rwkv_token_shift_lerp_sequence_f32`, and `rwkv7_wkv_delta_rule_sequence_f32` preserve exact step-by-step recurrence equivalence without heap allocations.
+
+## 5. Non-Token Machine-Model Kernels (`machine`)
+
+- **Continuous Feature Tokenizer (`tokenize_continuous_features_f32`)**: Computes `out[i * d_token + d] = raw[i] * weight[i * d_token + d] + bias[i * d_token + d]` across `[n_features, d_token]` (`VLA RVV 1.0` `vfmacc.vf` + portable scalar/strip-mined fallbacks), rejecting zero/overflow dimensions, mismatched slice lengths, and `NaN`/`±Inf` inputs upfront with `K3Error::TensorBoundsError`.
+- **`TinyTimeMixers` Residual Axis Mixer (`ttm_time_channel_mix_f32`, `gelu_f32`, `layernorm_f32`)**: Executes two-stage `LayerNorm + GELU_tanh MLP + residual` along `[n_patches, n_channels]` time/patch and channel axes, plus a zero-allocation `ttm_time_channel_mix_with_scratch_f32` path sized by `ttm_time_channel_mix_scratch_len`.
+- **`TabPFN-v2` Dual-Axis Attention (`tabpfn_dual_axis_attention_f32`, `tabpfn_dual_axis_self_attention_f32`)**: Reuses `dot_f32`, `softmax_scores_inplace`, and `axpy_f32` over `[n_samples, n_features, n_heads * head_dim]`, isolating context-to-query sample attention to `0..context_samples` so query rows never leak into context rows or neighboring queries.

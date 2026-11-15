@@ -234,6 +234,28 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
     }
 }
 
+/// Computes the `tanh`-based Gaussian Error Linear Unit (`GELU_tanh`) scalar approximation.
+///
+/// # Numerical Stability
+///
+/// Clamps extreme inputs beyond `[-15.0, 15.0]` where `tanh` saturates to `±1.0` so cubic
+/// intermediates never overflow to `NaN` or infinity.
+#[must_use]
+#[inline]
+pub fn gelu_scalar_f32(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    const GELU_CUBIC_COEF: f32 = 0.044_715;
+
+    if !x.is_finite() || x <= -15.0_f32 {
+        0.0_f32
+    } else if x >= 15.0_f32 {
+        x
+    } else {
+        let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC_COEF * x * x * x);
+        0.5_f32 * x * (1.0_f32 + inner.tanh())
+    }
+}
+
 /// Computes Gemma `GeGLU` gated activation using the `tanh` GELU approximation:
 /// `out[i] = GELU_tanh(gate[i]) * up[i]`.
 ///
@@ -246,22 +268,10 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
 ///
 /// Returns [`K3Error::TensorBoundsError`] if `out`, `gate`, and `up` lengths do not match or are empty.
 pub fn geglu_f32(out: &mut [f32], gate: &[f32], up: &[f32]) -> Result<(), K3Error> {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-    const GELU_CUBIC_COEF: f32 = 0.044_715;
-
     let len = validate_gated_activation_args("geglu", out, gate, up)?;
 
     for i in 0..len {
-        let g = gate[i];
-        let gelu = if !g.is_finite() || g <= -15.0_f32 {
-            0.0_f32
-        } else if g >= 15.0_f32 {
-            g
-        } else {
-            let inner = SQRT_2_OVER_PI * (g + GELU_CUBIC_COEF * g * g * g);
-            0.5_f32 * g * (1.0_f32 + inner.tanh())
-        };
-        out[i] = gelu * up[i];
+        out[i] = gelu_scalar_f32(gate[i]) * up[i];
     }
 
     Ok(())
