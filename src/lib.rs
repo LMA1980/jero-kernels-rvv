@@ -8,6 +8,8 @@
 use jero_core::{K3Error, QuantType, TensorView};
 
 pub mod attention;
+pub mod audio;
+pub mod embed;
 pub mod ime;
 pub mod machine;
 pub mod norm;
@@ -17,6 +19,9 @@ pub mod residual;
 pub mod rope;
 pub mod ssm;
 pub mod swiglu;
+pub mod vision;
+
+pub use embed as embedding;
 
 pub use attention::{
     AttentionMaskConfig, bidirectional_attention_f32, compute_deberta_rel_pos_bucket,
@@ -25,6 +30,23 @@ pub use attention::{
     gqa_causal_attention_prefill_kv_heads_f32, gqa_causal_attention_prefill_strided_kv_f32,
     gqa_causal_attention_with_scratch_f32, gqa_kv_head_partition, mla_absorbed_attention_f32,
     pool_sequence_f32,
+};
+pub use audio::{
+    WHISPER_FFT_POINTS, WHISPER_HOP_LENGTH, WHISPER_N_BINS_201, WHISPER_N_BINS_257, WHISPER_N_FFT,
+    conv1d_k3_gelu_f32, conv1d_k3_gelu_f32_scalar, hann_window_f32, hann_window_f32_scalar,
+    log_mel_spectrogram_whisper_f32, log_mel_spectrogram_whisper_f32_scalar,
+    rfft_power_spectrum_512_f32,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use audio::{conv1d_k3_gelu_f32_rvv, hann_window_f32_rvv, log_mel_spectrogram_whisper_f32_rvv};
+pub use embed::{
+    EMBED_POOL_CLS, EMBED_POOL_LAST_TOKEN, EMBED_POOL_MEAN, cosine_similarity_batch_f32,
+    cosine_similarity_batch_f32_scalar, pool_and_l2_normalize_f32,
+    pool_and_l2_normalize_f32_scalar, rerank_sigmoid_scores_f32, rerank_sigmoid_scores_f32_scalar,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use embed::{
+    cosine_similarity_batch_f32_rvv, pool_and_l2_normalize_f32_rvv, rerank_sigmoid_scores_f32_rvv,
 };
 #[cfg(all(target_arch = "riscv64", not(miri)))]
 pub use ime::tile_dot_rvv;
@@ -123,6 +145,15 @@ pub use swiglu::swiglu_f32_rvv;
 pub use swiglu::{
     bf16_to_f32_finite, bf16_to_f32_ieee, geglu_f32, gelu_scalar_f32, logit_softcap_tanh_inplace,
     swiglu_f32, swiglu_f32_scalar,
+};
+pub use vision::{
+    conv2d_patch_embed_f32, conv2d_patch_embed_f32_scalar, interpolate_2d_pos_embed_f32,
+    pixel_shuffle_merge_2x2_f32, pixel_shuffle_merge_2x2_f32_scalar, resize_rgb_bilinear_norm_f32,
+    resize_rgb_bilinear_norm_f32_scalar,
+};
+#[cfg(all(target_arch = "riscv64", not(miri)))]
+pub use vision::{
+    conv2d_patch_embed_f32_rvv, pixel_shuffle_merge_2x2_f32_rvv, resize_rgb_bilinear_norm_f32_rvv,
 };
 
 /// Number of scalar elements per `Q4_K_M` super-block.

@@ -192,7 +192,7 @@ impl TabPfnAttentionShape {
     }
 }
 
-fn bounds_error(
+pub(crate) fn bounds_error(
     tensor_name: &str,
     offset: usize,
     byte_len: usize,
@@ -208,7 +208,7 @@ fn bounds_error(
     }
 }
 
-fn check_positive_dim(name: &str, value: usize) -> Result<usize, K3Error> {
+pub(crate) fn check_positive_dim(name: &str, value: usize) -> Result<usize, K3Error> {
     if value == 0 {
         return Err(bounds_error(
             name,
@@ -221,7 +221,12 @@ fn check_positive_dim(name: &str, value: usize) -> Result<usize, K3Error> {
     Ok(value)
 }
 
-fn checked_product(name: &str, a: usize, b: usize, desc: &str) -> Result<usize, K3Error> {
+pub(crate) fn checked_product(
+    name: &str,
+    a: usize,
+    b: usize,
+    desc: &str,
+) -> Result<usize, K3Error> {
     a.checked_mul(b).ok_or_else(|| {
         bounds_error(
             name,
@@ -233,7 +238,7 @@ fn checked_product(name: &str, a: usize, b: usize, desc: &str) -> Result<usize, 
     })
 }
 
-fn check_exact_len(name: &str, actual: usize, expected: usize) -> Result<(), K3Error> {
+pub(crate) fn check_exact_len(name: &str, actual: usize, expected: usize) -> Result<(), K3Error> {
     if actual != expected {
         return Err(bounds_error(
             name,
@@ -246,7 +251,7 @@ fn check_exact_len(name: &str, actual: usize, expected: usize) -> Result<(), K3E
     Ok(())
 }
 
-fn check_all_finite(name: &str, data: &[f32]) -> Result<(), K3Error> {
+pub(crate) fn check_all_finite(name: &str, data: &[f32]) -> Result<(), K3Error> {
     for (idx, &val) in data.iter().enumerate() {
         if !val.is_finite() {
             return Err(bounds_error(
@@ -261,7 +266,7 @@ fn check_all_finite(name: &str, data: &[f32]) -> Result<(), K3Error> {
     Ok(())
 }
 
-fn check_positive_finite(name: &str, value: f32) -> Result<f32, K3Error> {
+pub(crate) fn check_positive_finite(name: &str, value: f32) -> Result<f32, K3Error> {
     if !value.is_finite() || value <= 0.0_f32 {
         return Err(bounds_error(
             name,
