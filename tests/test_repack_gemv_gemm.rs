@@ -736,9 +736,15 @@ fn test_standalone_vec_dot_q4_0_f16_bf16_parity() {
         }
 
         assert_eq!(out_gguf, out_rm);
+        let tol = if cfg!(all(target_arch = "riscv64", not(miri))) && quant == QuantType::Q4_0 {
+            // Native `riscv64` `vec_dot_q4_0` quantizes `input` on the fly to `BlockQ8_0`.
+            1e-2
+        } else {
+            1e-4
+        };
         for r in 0..rows {
             assert!(
-                (out_gguf[r] - expected[r]).abs() < 1e-4,
+                (out_gguf[r] - expected[r]).abs() < tol,
                 "{quant:?} row {r}: got {}, expected {}",
                 out_gguf[r],
                 expected[r]

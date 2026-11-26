@@ -514,10 +514,29 @@ fn test_matvec_q5_k_multi_block_rows_and_cols() {
         }
         let abs_diff = (actual_val - expected_row_sum).abs();
         let rel_diff = abs_diff / expected_row_sum.abs().max(1.0);
-        assert!(
-            abs_diff < 1e-2 && rel_diff < 1e-4,
-            "Row {r} mismatch: actual {actual_val} vs expected {expected_row_sum} (abs_diff: {abs_diff}, rel_diff: {rel_diff})"
-        );
+        if cfg!(all(target_arch = "riscv64", not(miri))) {
+            // Native `riscv64` `matvec_q5_k` quantizes `input` on the fly to `BlockQ8K` before
+            // executing 4-row integer `Q5_K x Q8_K` RVV dot products (~1% activation quantization).
+            let mut x_q8k = [jero_kernels_rvv::BlockQ8K::ZERO; 2];
+            jero_kernels_rvv::quantize_row_q8_k(&input, &mut x_q8k).unwrap();
+            let row_start = r * blocks_per_row * Q5_K_BLOCK_BYTES;
+            let row_end = row_start + blocks_per_row * Q5_K_BLOCK_BYTES;
+            let q8k_ref =
+                jero_kernels_rvv::vec_dot_q5_k_q8_k(&raw[row_start..row_end], &x_q8k).unwrap();
+            assert!(
+                (actual_val - q8k_ref).abs() < 1e-3,
+                "Row {r} Q8K parity mismatch: actual {actual_val} vs q8k_ref {q8k_ref}"
+            );
+            assert!(
+                rel_diff < 0.03,
+                "Row {r} Q8K quantization drift too large: actual {actual_val} vs expected {expected_row_sum} (rel_diff: {rel_diff})"
+            );
+        } else {
+            assert!(
+                abs_diff < 1e-2 && rel_diff < 1e-4,
+                "Row {r} mismatch: actual {actual_val} vs expected {expected_row_sum} (abs_diff: {abs_diff}, rel_diff: {rel_diff})"
+            );
+        }
     }
 }
 
