@@ -736,19 +736,48 @@ fn test_standalone_vec_dot_q4_0_f16_bf16_parity() {
         }
 
         assert_eq!(out_gguf, out_rm);
-        let tol = if cfg!(all(target_arch = "riscv64", not(miri))) && quant == QuantType::Q4_0 {
+        if cfg!(all(target_arch = "riscv64", not(miri))) && quant == QuantType::Q4_0 {
             // Native `riscv64` `vec_dot_q4_0` quantizes `input` on the fly to `BlockQ8_0`.
-            1e-2
+            let mut scalar_gguf = vec![0.0_f32; rows];
+            jero_kernels_rvv::vec_dot_q4_0_scalar(&mut scalar_gguf, &view_gguf, &input).unwrap();
+            let mut x_q8 = [jero_kernels_rvv::BlockQ8_0::ZERO; 3];
+            jero_kernels_rvv::quantize_row_q8_0_f32(&input, &mut x_q8).unwrap();
+            let row_stride = (cols / 32) * Q4_0_BLOCK_BYTES;
+            for r in 0..rows {
+                assert!(
+                    (scalar_gguf[r] - expected[r]).abs() < 1e-4,
+                    "{quant:?} scalar row {r}: got {}, expected {}",
+                    scalar_gguf[r],
+                    expected[r]
+                );
+                let q8_ref = jero_kernels_rvv::vec_dot_q4_0_q8_0(
+                    &raw[r * row_stride..(r + 1) * row_stride],
+                    &x_q8,
+                )
+                .unwrap();
+                assert!(
+                    (out_gguf[r] - q8_ref).abs() < 1e-4,
+                    "{quant:?} Q8_0 parity row {r}: got {}, q8_ref {}",
+                    out_gguf[r],
+                    q8_ref
+                );
+                let bound = expected[r].abs() * 0.02 + 0.05;
+                assert!(
+                    (out_gguf[r] - expected[r]).abs() <= bound,
+                    "{quant:?} row {r}: got {}, expected {}",
+                    out_gguf[r],
+                    expected[r]
+                );
+            }
         } else {
-            1e-4
-        };
-        for r in 0..rows {
-            assert!(
-                (out_gguf[r] - expected[r]).abs() < tol,
-                "{quant:?} row {r}: got {}, expected {}",
-                out_gguf[r],
-                expected[r]
-            );
+            for r in 0..rows {
+                assert!(
+                    (out_gguf[r] - expected[r]).abs() < 1e-4,
+                    "{quant:?} row {r}: got {}, expected {}",
+                    out_gguf[r],
+                    expected[r]
+                );
+            }
         }
     }
 }
