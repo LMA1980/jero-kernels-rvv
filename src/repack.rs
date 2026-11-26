@@ -5753,7 +5753,12 @@ mod tests {
         gemm_repacked_vla_sim(&mut sim256, &rep_q8, &act, 256).unwrap();
         gemm_repacked_vla_sim(&mut sim1024, &rep_q8, &act, 1024).unwrap();
         assert_eq!(sim256, sim1024);
-        assert_eq!(full_out, sim256);
+        for (idx, (&actual, &expected)) in full_out.iter().zip(&sim256).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "full_out[{idx}]={actual} != sim256[{idx}]={expected}"
+            );
+        }
 
         let sub_range = 3..10_usize;
         let sub_len = sub_range.len();

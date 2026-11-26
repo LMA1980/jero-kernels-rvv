@@ -500,8 +500,8 @@ mod tests {
         let expected_1 = (2.0 / (1.0 + (-2.0_f32).exp())) * 10.0;
         assert!((out[1] - expected_1).abs() < 1e-4);
 
-        // Large negative (-25.0) -> SiLU ≈ 0.0 -> out[2] = 0.0
-        assert_eq!(out[2], 0.0);
+        // Large negative (-25.0) -> SiLU ≈ 0.0 (RVV polynomial exp gives ~ -6.94e-10)
+        assert!(out[2].abs() < 1e-6);
 
         // Large positive (30.0) -> SiLU ≈ 30.0 -> out[3] ≈ 30.0 * 0.5 = 15.0
         assert!((out[3] - 15.0).abs() < 1e-4);

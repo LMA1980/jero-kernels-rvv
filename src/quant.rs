@@ -475,7 +475,7 @@ pub fn dequantize_iq4_nl_row_rvv(row_bytes: &[u8], out: &mut [f32]) -> Result<()
         .zip(out.chunks_exact_mut(IQ4_NL_BLOCK_ELEMENTS))
     {
         let d = f16_to_f32_finite(u16::from_le_bytes([blk_bytes[0], blk_bytes[1]]));
-        if d == 0.0 && d.is_sign_positive() {
+        if d == 0.0 {
             out_chunk.fill(0.0);
             continue;
         }
@@ -2941,6 +2941,18 @@ mod tests {
             .expect("Q5_0 view");
         let mut dot_out = [0.0_f32; 1];
         vec_dot_q5_0(&mut dot_out, &view_q5, &x).unwrap();
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            // On `riscv64`, `vec_dot_q5_0` quantizes `f32` activations on the fly to `BlockQ8_0`
+            // and runs integer `Q5_0 x Q8_0` RVV kernels; verify exact parity with that quantized
+            // reference and bounded Q8_0 quantization delta vs the unquantized `f32` dot product.
+            let mut x_q8_blocks = [BlockQ8_0::ZERO; 2];
+            quantize_row_q8_0_f32(&x, &mut x_q8_blocks).unwrap();
+            let q8_ref = vec_dot_q5_0_q8_0_blocks(&q5_0_row, &x_q8_blocks).unwrap();
+            assert!((dot_out[0] - q8_ref).abs() < 1e-4);
+            assert!((dot_out[0] - ref_dot).abs() <= ref_dot.abs() * 0.02 + 0.05);
+        }
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
         assert!((dot_out[0] - ref_dot).abs() < 1e-4);
 
         // Quantized Q8_0 activation dot helper vs ref_dot
