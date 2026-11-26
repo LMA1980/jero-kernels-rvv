@@ -101,23 +101,22 @@ pub fn hann_window_f32_rvv(out: &mut [f32], n_fft: usize) -> Result<(), K3Error>
         let theta = 2.0_f64 * PI * (n as f64) / denom;
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "cosine lies strictly in [-1.0, 1.0]"
+            reason = "1.0 - cos(theta) lies strictly in [0.0, 2.0]"
         )]
         {
-            *slot = theta.cos() as f32;
+            *slot = (1.0_f64 - theta.cos()) as f32;
         }
     }
 
     let mut po = out.as_mut_ptr();
     let mut rem = n_fft;
-    // SAFETY: `po` covers `rem` contiguous `f32` elements; `vfrsub.vf` + `vfmul.vf` evaluates
-    // `0.5 * (1.0 - cos)` in VLA `e32, m4` strips.
+    // SAFETY: `po` covers `rem` contiguous `f32` elements; `vfmul.vf` scales by `0.5`
+    // in VLA `e32, m4` strips without `f32` cancellation near `cos = 1.0`.
     unsafe {
         core::arch::asm!(
             "2:",
             "vsetvli t0, {rem}, e32, m4, ta, ma",
             "vle32.v v8, ({po})",
-            "vfrsub.vf v8, v8, {one}",
             "vfmul.vf v8, v8, {half}",
             "vse32.v v8, ({po})",
             "slli t1, t0, 2",
@@ -126,7 +125,6 @@ pub fn hann_window_f32_rvv(out: &mut [f32], n_fft: usize) -> Result<(), K3Error>
             "bnez {rem}, 2b",
             po = inout(reg) po,
             rem = inout(reg) rem,
-            one = in(freg) 1.0_f32,
             half = in(freg) 0.5_f32,
             out("t0") _, out("t1") _,
             out("v8") _, out("v9") _, out("v10") _, out("v11") _,

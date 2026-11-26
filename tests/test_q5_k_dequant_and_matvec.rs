@@ -498,7 +498,8 @@ fn test_matvec_q5_k_multi_block_rows_and_cols() {
     // Oracle calculation
     let blocks_per_row = cols / Q5_K_BLOCK_ELEMENTS;
     let mut dequant_buf = [0.0_f32; Q5_K_BLOCK_ELEMENTS];
-    for (r, &actual_val) in output.iter().enumerate().take(rows) {
+    let mut expected_rows = vec![0.0_f32; rows];
+    for (r, slot) in expected_rows.iter_mut().enumerate() {
         let mut expected_row_sum = 0.0_f32;
         for blk in 0..blocks_per_row {
             let blk_idx = r * blocks_per_row + blk;
@@ -512,12 +513,57 @@ fn test_matvec_q5_k_multi_block_rows_and_cols() {
             }
             expected_row_sum += blk_sum;
         }
-        let abs_diff = (actual_val - expected_row_sum).abs();
+        *slot = expected_row_sum;
+    }
+
+    let mut scalar_out = vec![0.0_f32; rows];
+    jero_kernels_rvv::vec_dot_q5_k_scalar(&mut scalar_out, &view, &input).expect("scalar matvec");
+    for (r, (&scalar_val, &expected_row_sum)) in scalar_out.iter().zip(&expected_rows).enumerate() {
+        let abs_diff = (scalar_val - expected_row_sum).abs();
         let rel_diff = abs_diff / expected_row_sum.abs().max(1.0);
         assert!(
             abs_diff < 1e-2 && rel_diff < 1e-4,
-            "Row {r} mismatch: actual {actual_val} vs expected {expected_row_sum} (abs_diff: {abs_diff}, rel_diff: {rel_diff})"
+            "Row {r} scalar mismatch: actual {scalar_val} vs expected {expected_row_sum} (abs_diff: {abs_diff}, rel_diff: {rel_diff})"
         );
+    }
+
+    if cfg!(all(target_arch = "riscv64", not(miri))) {
+        // Native `riscv64` `matvec_q5_k` quantizes `input` on the fly to `BlockQ8K` before
+        // executing 4-row integer `Q5_K x Q8_K` RVV dot products.
+        let mut x_q8k = [jero_kernels_rvv::BlockQ8K::ZERO; 2];
+        jero_kernels_rvv::quantize_row_q8_k(&input, &mut x_q8k).unwrap();
+        for (r, &actual_val) in output.iter().enumerate() {
+            let row_start = r * blocks_per_row * Q5_K_BLOCK_BYTES;
+            let row_end = row_start + blocks_per_row * Q5_K_BLOCK_BYTES;
+            let q8k_ref =
+                jero_kernels_rvv::vec_dot_q5_k_q8_k(&raw[row_start..row_end], &x_q8k).unwrap();
+            assert!(
+                (actual_val - q8k_ref).abs() < 1e-3,
+                "Row {r} Q8K parity mismatch: actual {actual_val} vs q8k_ref {q8k_ref}"
+            );
+        }
+        let dot: f64 = output
+            .iter()
+            .zip(&expected_rows)
+            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+            .sum();
+        let norm_a: f64 = output
+            .iter()
+            .map(|&a| f64::from(a).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let norm_b: f64 = expected_rows
+            .iter()
+            .map(|&b| f64::from(b).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let cosine_sim = dot / (norm_a * norm_b);
+        assert!(
+            cosine_sim > 0.999,
+            "Q5_K vs f32 oracle cosine {cosine_sim} <= 0.999"
+        );
+    } else {
+        assert_eq!(output, scalar_out);
     }
 }
 

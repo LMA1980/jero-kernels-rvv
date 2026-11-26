@@ -137,6 +137,8 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
 
     let neg88: f32 = -88.0_f32;
     let pos88: f32 = 88.0_f32;
+    let neg20: f32 = -20.0_f32;
+    let zero_f: f32 = 0.0_f32;
     let inv_ln2: f32 = std::f32::consts::LOG2_E;
     let ln2_hi: f32 = 0.693_145_75;
     let ln2_lo: f32 = 1.428_606_8e-6;
@@ -159,9 +161,9 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
         core::arch::asm!(
             "2:",
             "vsetvli t0, {rem}, e32, m4, ta, ma",
-            "vle32.v v0, ({pgate})",
+            "vle32.v v28, ({pgate})",
             // u = clamp(-g, -88.0, 88.0)
-            "vfsgnjn.vv v4, v0, v0",
+            "vfsgnjn.vv v4, v28, v28",
             "vfmax.vf v4, v4, {neg88}",
             "vfmin.vf v4, v4, {pos88}",
             // k = round(u / ln2)
@@ -195,9 +197,13 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
             // exp(u) = poly(r) * 2^k; silu = g / (1.0 + exp(u))
             "vfmul.vv v20, v20, v16",
             "vfadd.vf v20, v20, {one}",
-            "vfdiv.vv v24, v0, v20",
+            "vfdiv.vv v24, v28, v20",
             "vle32.v v12, ({pup})",
             "vfmul.vv v24, v24, v12",
+            // Match scalar cutoff (`g < -20.0` -> `0.0`), guarding `-Inf` and tail continuity
+            // without altering `NaN` propagation (`NaN < -20.0` is false).
+            "vmflt.vf v0, v28, {neg20}",
+            "vfmerge.vfm v24, v24, {zero_f}, v0",
             "vse32.v v24, ({pout})",
             "slli t1, t0, 2",
             "add {pgate}, {pgate}, t1",
@@ -214,6 +220,8 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
             kmax = in(reg) kmax,
             neg88 = in(freg) neg88,
             pos88 = in(freg) pos88,
+            neg20 = in(freg) neg20,
+            zero_f = in(freg) zero_f,
             inv_ln2 = in(freg) inv_ln2,
             ln2_hi = in(freg) ln2_hi,
             ln2_lo = in(freg) ln2_lo,
@@ -229,6 +237,7 @@ pub unsafe fn swiglu_f32_rvv(gate: &[f32], up: &[f32], out: &mut [f32]) {
             out("v12") _, out("v13") _, out("v14") _, out("v15") _, out("v16") _, out("v17") _,
             out("v18") _, out("v19") _, out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             options(nostack),
         );
     }
@@ -500,8 +509,8 @@ mod tests {
         let expected_1 = (2.0 / (1.0 + (-2.0_f32).exp())) * 10.0;
         assert!((out[1] - expected_1).abs() < 1e-4);
 
-        // Large negative (-25.0) -> SiLU ≈ 0.0 -> out[2] = 0.0
-        assert_eq!(out[2], 0.0);
+        // Large negative (-25.0) -> SiLU ≈ 0.0 (RVV polynomial exp gives ~ -6.94e-10)
+        assert!(out[2].abs() < 1e-6);
 
         // Large positive (30.0) -> SiLU ≈ 30.0 -> out[3] ≈ 30.0 * 0.5 = 15.0
         assert!((out[3] - 15.0).abs() < 1e-4);

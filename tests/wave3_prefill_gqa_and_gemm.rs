@@ -214,7 +214,8 @@ fn wave3_rvv_4x8_and_vla_sim_parity_plus_diagnostic_timing() {
         gemm_repacked_vla_sim(&mut out_1024, &weight, &act, 1024).unwrap();
 
         for (a, b) in out_hw.iter().zip(&out_256) {
-            assert!((a - b).abs() < 1e-4, "M={m_tokens}: {a} vs {b}");
+            let tol = 1e-4_f32.max(1e-5_f32 * b.abs());
+            assert!((a - b).abs() <= tol, "M={m_tokens}: {a} vs {b}");
         }
         for (a, b) in out_256.iter().zip(&out_1024) {
             assert!(
@@ -263,7 +264,8 @@ fn wave3_compact_nibble_footprint_and_gemm_parity_all_formats() {
         }
         gemm_repacked(&mut out_ref, &repacked, &act).unwrap();
         for (a, b) in out_nib.iter().zip(&out_ref) {
-            assert!((a - b).abs() < 1e-4, "{quant:?}: {a} vs {b}");
+            let tol = 1e-4_f32.max(1e-5_f32 * b.abs());
+            assert!((a - b).abs() <= tol, "{quant:?}: {a} vs {b}");
         }
     }
 

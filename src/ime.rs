@@ -1118,32 +1118,110 @@ mod tests {
     use super::*;
 
     #[cfg(all(target_arch = "riscv64", not(miri)))]
-    fn pin_to_a100_for_test() {
-        // SAFETY: Linux riscv64 `SYS_gettid` (178) and `SYS_sched_setaffinity` (122)
-        // on the calling thread after registering with `/proc/set_ai_thread`.
+    #[inline(never)]
+    fn pin_to_a100_for_test() -> bool {
+        const SYS_OPENAT: isize = 56;
+        const SYS_CLOSE: isize = 57;
+        const SYS_WRITE: isize = 64;
+        const SYS_SCHED_SETAFFINITY: isize = 122;
+        const SYS_SCHED_GETAFFINITY: isize = 123;
+        const SYS_GETTID: isize = 178;
+        const AT_FDCWD: isize = -100;
+        const O_WRONLY: isize = 1;
+
+        // SAFETY: Scalar-only, heap-free Linux `riscv64` syscalls so the stack frame size does not
+        // depend on `vlenb` across the `X100` (`vlenb = 32`) -> `A100` (`vlenb = 128`) boundary.
         unsafe {
             let tid: isize;
             core::arch::asm!(
-                "li a7, 178",
                 "ecall",
+                in("a7") SYS_GETTID,
                 lateout("a0") tid,
-                out("a7") _,
                 options(nostack),
             );
-            let _ = std::fs::write("/proc/set_ai_thread", format!("{tid}"));
-            let mask: u64 = 1_u64 << 8;
-            let rc: isize;
+            if tid <= 0 {
+                return false;
+            }
+
+            // Conditional `/proc/set_ai_thread` registration for vendor HMP kernels (ignored if absent).
+            let path = b"/proc/set_ai_thread\0";
+            let fd: isize;
             core::arch::asm!(
-                "li a7, 122",
                 "ecall",
-                inlateout("a0") 0_isize => rc,
-                in("a1") size_of::<u64>(),
-                in("a2") core::ptr::addr_of!(mask),
-                out("a7") _,
+                in("a7") SYS_OPENAT,
+                in("a0") AT_FDCWD,
+                in("a1") path.as_ptr(),
+                in("a2") O_WRONLY,
+                in("a3") 0_isize,
+                lateout("a0") fd,
                 options(nostack),
             );
-            let _ = rc;
+            if fd >= 0 {
+                let mut buf = [0_u8; 32];
+                let mut tmp = [0_u8; 32];
+                let mut val = tid;
+                let mut i = 0_usize;
+                while val > 0 {
+                    tmp[i] = b'0' + u8::try_from(val % 10).unwrap_or(0);
+                    val /= 10;
+                    i += 1;
+                }
+                for j in 0..i {
+                    buf[j] = tmp[i - 1 - j];
+                }
+                buf[i] = b'\n';
+                let _wr: isize;
+                core::arch::asm!(
+                    "ecall",
+                    in("a7") SYS_WRITE,
+                    in("a0") fd,
+                    in("a1") buf.as_ptr(),
+                    in("a2") i + 1,
+                    lateout("a0") _wr,
+                    options(nostack),
+                );
+                let _cl: isize;
+                core::arch::asm!(
+                    "ecall",
+                    in("a7") SYS_CLOSE,
+                    in("a0") fd,
+                    lateout("a0") _cl,
+                    options(nostack),
+                );
+            }
+
+            let expected_mask: u64 = 1_u64 << 8;
+            let set_rc: isize;
+            core::arch::asm!(
+                "ecall",
+                in("a7") SYS_SCHED_SETAFFINITY,
+                in("a0") 0_isize,
+                in("a1") size_of::<u64>(),
+                in("a2") core::ptr::addr_of!(expected_mask),
+                lateout("a0") set_rc,
+                options(nostack),
+            );
+            if set_rc < 0 {
+                return false;
+            }
+
+            let mut observed_mask: u64 = 0;
+            let get_rc: isize;
+            core::arch::asm!(
+                "ecall",
+                in("a7") SYS_SCHED_GETAFFINITY,
+                in("a0") 0_isize,
+                in("a1") size_of::<u64>(),
+                in("a2") core::ptr::addr_of_mut!(observed_mask),
+                lateout("a0") get_rc,
+                options(nostack),
+            );
+            if get_rc < 0 || observed_mask != expected_mask {
+                return false;
+            }
         }
+
+        vlen_bytes() == 128
     }
 
     #[expect(clippy::cast_possible_truncation, reason = "bounded modulo 17")]
@@ -1153,10 +1231,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn ime_vector_and_scalar_paths_are_bit_identical() {
-        #[cfg(all(target_arch = "riscv64", not(miri)))]
-        pin_to_a100_for_test();
+    #[inline(never)]
+    fn ime_vector_and_scalar_paths_body() {
         #[cfg(all(target_arch = "riscv64", not(miri)))]
         assert!(ime_probe_exec());
         let (rows_m, cols_n, depth_k) = (6, 12, 64);
@@ -1198,6 +1274,37 @@ mod tests {
         }
         assert!(ime_vmadot_count() > 0);
         assert!(vector_dot_count() > 0);
+    }
+
+    #[cfg(all(target_arch = "riscv64", not(miri)))]
+    #[inline(never)]
+    fn a100_ime_worker_entry() -> Result<(), &'static str> {
+        if !pin_to_a100_for_test() {
+            return Err("failed to pin thread to A100 core 8 with vlenb = 128");
+        }
+        ime_vector_and_scalar_paths_body();
+        Ok(())
+    }
+
+    #[test]
+    fn ime_vector_and_scalar_paths_are_bit_identical() {
+        #[cfg(all(target_arch = "riscv64", not(miri)))]
+        {
+            // Execute on a fresh thread pinned before entering the vector/IME body so prologue and
+            // epilogue run in the same `vlenb = 128` domain without pinning the test runner thread.
+            let handle = std::thread::Builder::new()
+                .name("a100-ime-test".to_owned())
+                .spawn(a100_ime_worker_entry)
+                .expect("spawn A100 IME test thread");
+            handle
+                .join()
+                .expect("A100 IME test thread panicked")
+                .expect("A100 affinity/IME verification failed");
+        }
+        #[cfg(any(not(target_arch = "riscv64"), miri))]
+        {
+            ime_vector_and_scalar_paths_body();
+        }
     }
 
     #[test]
